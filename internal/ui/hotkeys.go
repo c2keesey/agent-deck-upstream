@@ -13,6 +13,7 @@ const (
 	hotkeyQuickCreate      = "quick_create"
 	hotkeyRename           = "rename"
 	hotkeyRestart          = "restart"
+	hotkeyHardRestart      = "hard_restart"
 	hotkeyRestartFresh     = "restart_fresh"
 	hotkeyDelete           = "delete"
 	hotkeyCloseSession     = "close_session"
@@ -48,6 +49,10 @@ const (
 	hotkeyReload           = "reload"
 	hotkeyDetach           = "detach"
 	hotkeyWatcherPanel     = "watcher_panel"
+	// Local fork additions.
+	hotkeyMRUCycle       = "mru_cycle"
+	hotkeyAttentionCycle = "attention_cycle"
+	hotkeyTeardown       = "teardown"
 	// Session switcher. While attached it is intercepted in the tmux attach
 	// loop (see internal/tmux/pty.go AttachOptions); on the home screen it is
 	// dispatched like any other hotkey. Must resolve to a "ctrl+<letter>" chord.
@@ -60,6 +65,7 @@ var hotkeyActionOrder = []string{
 	hotkeyQuickCreate,
 	hotkeyRename,
 	hotkeyRestart,
+	hotkeyHardRestart,
 	hotkeyRestartFresh,
 	hotkeyDelete,
 	hotkeyCloseSession,
@@ -94,60 +100,82 @@ var hotkeyActionOrder = []string{
 	hotkeyImport,
 	hotkeyReload,
 	hotkeyDetach,
+	hotkeyMRUCycle,
+	hotkeyAttentionCycle,
 	hotkeyWatcherPanel,
+	hotkeyTeardown,
 	hotkeySwitchSession,
 }
 
+// defaultHotkeyBindings keeps the local fork keymap as the source of truth
+// (the user relies on this muscle memory: teardown=y, attention=ctrl+e,
+// mru=ctrl+w, hard_restart=ctrl+t, restart=t, settings=p, quick_create=a, …).
+// Upstream's v1.9.x keybinding overhaul (restart→R, close→D, move→M, settings→S,
+// toggle_yolo→y, quick_create→N, etc.) is intentionally NOT adopted. Upstream's
+// genuinely-new actions are grafted onto free keys when their upstream default
+// collides with a local binding: cycle_group_view→V (upstream t=restart),
+// worktree_setup→B (upstream b=exec_shell), quick_approve→ctrl+a (upstream
+// a=quick_create). toggle_yolo stays unbound (upstream y=teardown).
 var defaultHotkeyBindings = map[string]string{
 	hotkeyQuit:             "q",
 	hotkeyNewSession:       "n",
-	hotkeyQuickCreate:      "N",
+	hotkeyQuickCreate:      "a",
 	hotkeyRename:           "r",
-	hotkeyRestart:          "R",
+	hotkeyRestart:          "t",
+	hotkeyHardRestart:      "ctrl+t",
 	hotkeyRestartFresh:     "T",
 	hotkeyDelete:           "d",
-	hotkeyCloseSession:     "D",
+	hotkeyCloseSession:     "ctrl+x",
 	hotkeyArchiveSession:   "A",
 	hotkeyUnarchiveSession: "shift+u",
 	hotkeyViewArchived:     "^",
 	hotkeyUndoDelete:       "ctrl+z",
-	hotkeyMoveToGroup:      "M",
+	hotkeyMoveToGroup:      "o",
 	hotkeyMCPManager:       "m",
 	hotkeyPluginManager:    "L",
 	hotkeySkillsManager:    "s",
 	hotkeyTogglePreview:    "v",
-	hotkeyCycleGroupView:   "t",
+	hotkeyCycleGroupView:   "V", // upstream "t" collides with local restart; use shift+v (View)
 	hotkeyMarkUnread:       "u",
-	hotkeyQuickApprove:     "a",
-	hotkeyPromptSession:    "o",
-	hotkeyToggleYolo:       "y",
+	hotkeyQuickApprove:     "ctrl+a", // local: 'a' is quick-create; user runs bypass-permissions so approve is parked off the home row
+	hotkeyPromptSession:    "O",      // upstream #1410 defaults this to "o", which collides with local move_to_group; remapped to shift+O (pairs with lowercase o)
+	hotkeyToggleYolo:       "",       // upstream "y" collides with local teardown
 	hotkeyQuickFork:        "f",
-	hotkeyForkWithOptions:  "F",
+	hotkeyForkWithOptions:  "z",
 	hotkeyCopyOutput:       "c",
 	hotkeySendOutput:       "x",
-	hotkeyExecShell:        "E",
+	hotkeyExecShell:        "b",
 	hotkeyEditNotes:        "e",
-	hotkeyEditPaths:        "p",
-	hotkeyEditSession:      "P",
-	hotkeyWorktreeSetup:    "b",
-	hotkeyWorktreeFinish:   "W",
+	hotkeyEditPaths:        "",
+	hotkeyEditSession:      "",
+	hotkeyWorktreeSetup:    "B", // upstream "b" collides with local exec_shell; use shift+b
+	hotkeyWorktreeFinish:   "w",
 	hotkeyCreateGroup:      "g",
 	hotkeySearch:           "/",
 	hotkeyHelp:             "?",
-	hotkeySettings:         "S",
+	hotkeySettings:         "p",
 	hotkeyImport:           "i",
 	hotkeyReload:           "ctrl+r",
 	hotkeyDetach:           "ctrl+q",
-	hotkeyWatcherPanel:     "w",
-	hotkeySwitchSession:    "ctrl+s",
+	// mru_cycle is UNBOUND: the local blind MRU cursor-cycle is superseded by
+	// upstream's MRU-ordered session switcher, bound to ctrl+w below.
+	hotkeyMRUCycle:       "",
+	hotkeyAttentionCycle: "ctrl+e",
+	hotkeyWatcherPanel:   "",
+	hotkeyTeardown:       "y",
+	// switch_session = ctrl+w (local remap). Upstream defaults this to Ctrl+S,
+	// but Ctrl+S is XOFF / what some terminals send for Cmd+Right, so it kept
+	// triggering unexpectedly. Ctrl+W is the user's old MRU key and the switcher
+	// is MRU-ordered, so it cleanly replaces the local MRU cursor-cycle. The old
+	// overview Ctrl+S handler stays removed from handleMainKey.
+	hotkeySwitchSession: "ctrl+w",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{
 	hotkeyQuit:            {"q", "ctrl+c"},
-	hotkeyForkWithOptions: {"F", "shift+f"},
-	hotkeyMoveToGroup:     {"M", "shift+m"},
-	hotkeyWorktreeFinish:  {"W", "shift+w"},
-	hotkeyEditSession:     {"P", "shift+p"},
+	hotkeyForkWithOptions: {"z"},
+	hotkeyMoveToGroup:     {"o"},
+	hotkeyWorktreeFinish:  {"w"},
 }
 
 // renamedHotkeys maps old action names to new names for backward compatibility.

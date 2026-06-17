@@ -615,7 +615,7 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	d.commandInput.SetValue("echo original")
 	d.claudeOptions.SetFromOptions(originalClaude)
 	d.geminiOptions.SetDefaults(true)
-	d.codexOptions.SetDefaults(true)
+	d.codexOptions.SetDefaults(true, true)
 
 	snapshot := d.saveSnapshot()
 
@@ -626,7 +626,7 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	d.commandInput.SetValue("echo mutated")
 	d.claudeOptions.SetFromOptions(&session.ClaudeOptions{SessionMode: "new"})
 	d.geminiOptions.SetDefaults(false)
-	d.codexOptions.SetDefaults(false)
+	d.codexOptions.SetDefaults(false, false)
 
 	d.restoreSnapshot(snapshot)
 
@@ -651,6 +651,8 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 		t.Fatalf("restored Claude session mode/id = %q/%q, want resume/abc123",
 			restoredClaude.SessionMode, restoredClaude.ResumeSessionID)
 	}
+	// Personal fork: the Claude happy-wrapper toggle was removed from the new
+	// dialog upstream, so UseHappy no longer round-trips through the snapshot.
 	if !restoredClaude.SkipPermissions || !restoredClaude.UseChrome || !restoredClaude.UseTeammateMode {
 		t.Fatalf("restored Claude toggles incorrect: %+v", restoredClaude)
 	}
@@ -659,6 +661,9 @@ func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing
 	}
 	if !d.codexOptions.GetYoloMode() {
 		t.Fatal("codex yolo mode was not restored")
+	}
+	if !d.codexOptions.GetUseHappy() {
+		t.Fatal("codex happy mode was not restored")
 	}
 }
 
@@ -1602,32 +1607,63 @@ func TestNewDialog_FilterPaths_EmptyInput(t *testing.T) {
 	}
 }
 
-func TestNewDialog_BranchPrefix_Default(t *testing.T) {
+// ===== Generated Name Fallback Tests =====
+
+// TestNewDialog_CtrlR_OpensRecentPicker verifies that Ctrl+R opens the recent
+// sessions picker when recent sessions are available.
+func TestNewDialog_CtrlR_OpensRecentPicker(t *testing.T) {
 	d := NewNewDialog()
-	if d.branchPrefix != "feature/" {
-		t.Errorf("expected branchPrefix %q from constructor, got %q", "feature/", d.branchPrefix)
+	d.SetSize(80, 40)
+	d.Show()
+
+	// Set up recent sessions
+	sessions := []*statedb.RecentSessionRow{
+		{Title: "session-1", ProjectPath: "/tmp/one", Tool: "claude"},
+		{Title: "session-2", ProjectPath: "/tmp/two", Tool: "claude"},
+	}
+	d.SetRecentSessions(sessions)
+
+	if len(d.recentSessions) != 2 {
+		t.Fatalf("expected 2 recent sessions, got %d", len(d.recentSessions))
+	}
+
+	// Verify ^R hint appears in the view
+	view := d.View()
+	if !strings.Contains(view, "^R recent") {
+		t.Error("View should contain '^R recent' hint when recent sessions exist")
+	}
+
+	// Verify picker is not open yet
+	if d.showRecentPicker {
+		t.Fatal("recent picker should not be open before Ctrl+R")
+	}
+
+	// Send Ctrl+R
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+
+	if !d.showRecentPicker {
+		t.Error("Ctrl+R should open the recent sessions picker")
+	}
+	if d.recentSessionCursor != 0 {
+		t.Errorf("recentSessionCursor = %d, want 0", d.recentSessionCursor)
+	}
+	// First session should be previewed
+	if d.nameInput.Value() != "session-1" {
+		t.Errorf("name = %q, want %q (first session should be previewed)", d.nameInput.Value(), "session-1")
 	}
 }
 
-func TestNewDialog_BranchPrefix_Custom_AutoPopulates(t *testing.T) {
+// TestNewDialog_CtrlR_HintHiddenWhenNoRecents verifies the hint is absent
+// when there are no recent sessions.
+func TestNewDialog_CtrlR_HintHiddenWhenNoRecents(t *testing.T) {
 	d := NewNewDialog()
-	d.branchPrefix = "dev/"
-	d.nameInput.SetValue("my-session")
-	d.autoBranchFromName()
+	d.SetSize(80, 40)
+	d.Show()
 
-	if got := d.branchInput.Value(); got != "dev/my-session" {
-		t.Errorf("expected branch %q, got %q", "dev/my-session", got)
-	}
-}
-
-func TestNewDialog_BranchPrefix_Empty_NoPrefix(t *testing.T) {
-	d := NewNewDialog()
-	d.branchPrefix = ""
-	d.nameInput.SetValue("my-session")
-	d.autoBranchFromName()
-
-	if got := d.branchInput.Value(); got != "my-session" {
-		t.Errorf("expected branch %q, got %q", "my-session", got)
+	// No recent sessions set
+	view := d.View()
+	if strings.Contains(view, "^R recent") {
+		t.Error("View should NOT contain '^R recent' hint when no recent sessions exist")
 	}
 }
 

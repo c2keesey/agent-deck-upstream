@@ -89,6 +89,18 @@ func TestNoRawTmuxExec_OutsideAllowlist(t *testing.T) {
 			{"tmux", "display-message", "-p", ""}, // multi-field variant (empty sentinel; matched loosely below)
 			{"tmux", "display-message", "-p", "#{session_name}"},
 		},
+
+		// `agent-deck idea` runs INSIDE a tmux display-popup (Ctrl+Alt+I), so it
+		// must read the surrounding session via the inherited $TMUX env, NOT a
+		// -L DefaultSocketName factory call — same "who am I" justification as
+		// cli_utils.go / session_cmd.go above. It only inspects the current
+		// session (name, pane path, CLAUDE_SESSION_ID env); it never starts or
+		// mutates a server, so socket isolation is not at risk.
+		"cmd/agent-deck/idea_cmd.go": {
+			{"tmux", "display-message", "-p", "#{session_name}"},
+			{"tmux", "display-message", "-p", "-t"},
+			{"tmux", "show-environment", "-t"},
+		},
 	}
 
 	violations := scanForRawTmuxExec(t, root)

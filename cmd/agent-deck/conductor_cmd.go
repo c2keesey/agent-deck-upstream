@@ -620,7 +620,11 @@ func handleConductorSetup(profile string, args []string) {
 
 	// Step 8: Install transition notifier daemon (always-on status-driven notifications)
 	var notifierDaemonPath string
-	if daemonPath, err := session.InstallTransitionNotifierDaemon(); err != nil {
+	if os.Getenv("AGENT_DECK_DISABLE_NOTIFIER") != "" {
+		if !*jsonOutput {
+			fmt.Println("[skip] Transition notifier daemon disabled via AGENT_DECK_DISABLE_NOTIFIER")
+		}
+	} else if daemonPath, err := session.InstallTransitionNotifierDaemon(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to install transition notifier daemon: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Tip: %s\n", session.TransitionNotifierDaemonHint())
 	} else {

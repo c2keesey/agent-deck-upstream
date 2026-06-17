@@ -329,6 +329,13 @@ type Instance struct {
 	// so existing sessions are unaffected on upgrade.
 	IdleTimeoutSecs int64 `json:"idle_timeout_secs,omitempty"`
 
+	// Priority (local fork) is the conductor-assigned importance tier that
+	// drives the Ctrl+E attention cycle and the higher-priority-ready status
+	// nudge. 0 = unset, 1 (highest) .. 3 (lowest). Persisted via the
+	// tool_data extras zone (see priority.go) so legacy binaries round-trip
+	// it untouched. Default 0 leaves Ctrl+E ordering by longest-waiting.
+	Priority int `json:"priority,omitempty"`
+
 	// IsForkAwaitingStart signals that this instance was produced by a
 	// fork builder and must run a pre-built fork command verbatim on the
 	// first Start() (#745). Claude fork targets usually store that command
@@ -423,6 +430,11 @@ type Instance struct {
 	// Rate-limits expensive session metadata sync work (Claude/Gemini/Codex)
 	// that runs from UpdateStatus while this instance lock is held.
 	lastSessionMetaSync time.Time
+
+	// Rate-limits filesystem-based session ID detection (syncClaudeSessionFromDisk)
+	// for sessions that were started without pre-generating a session ID
+	// (e.g., -c/continue mode, -r/interactive resume).
+	lastDiskSessionSync time.Time
 
 	// SkipMCPRegenerate skips .mcp.json regeneration on next Restart()
 	// Set by MCP dialog Apply() to avoid race condition where Apply writes
@@ -2905,6 +2917,27 @@ func (i *Instance) buildTmuxOptionOverrides() map[string]string {
 // two grep-stable lines for a Phase 5 discovery start, distinguishable
 // by the `reason=` attr.
 func (i *Instance) ensureClaudeSessionIDFromDisk() {
+	// Issue #1147 (Start-path twin): an explicit `--session-id <uuid>` in
+	// i.Command is the user's authoritative declaration of WHICH conversation
+	// this session owns, and supersedes any disk-discovery candidate. The
+	// Restart-path variant (ensureClaudeSessionIDFromDiskForRestart) already
+	// honors it; the cold-boot Start path must too, or N sessions recovering
+	// in one shared cwd — each with its own --session-id — all disk-discover
+	// the newest sibling JSONL by mtime and converge onto a single id. That
+	// shared id then leaks across the title-sync path (a name set on one
+	// session reappears on its siblings) and trips the duplicate-session
+	// sweeper. Adopt the explicit id BEFORE the non-empty short-circuit so it
+	// also corrects an id hijacked by an earlier buggy run.
+	if explicit, ok := extractExplicitClaudeSessionID(i.Command); ok {
+		if i.ClaudeSessionID != explicit {
+			i.ClaudeSessionID = explicit
+			sessionLog.Info("resume: id="+explicit+" reason=session_id_flag_explicit_start",
+				slog.String("instance_id", i.ID),
+				slog.String("claude_session_id", explicit),
+				slog.String("reason", "session_id_flag_explicit_start"))
+		}
+		return
+	}
 	if i.ClaudeSessionID != "" {
 		return
 	}
@@ -3999,9 +4032,11 @@ func (i *Instance) UpdateStatus() error {
 
 // UpdateClaudeSession updates the Claude session ID from tmux environment.
 // The capture-resume pattern (used in Start/Fork/Restart) sets CLAUDE_SESSION_ID
-// in the tmux environment, making this the single authoritative source.
+// in the tmux environment, making this the primary source.
 //
-// No file scanning fallback - we rely on the consistent capture-resume pattern.
+// Self-heals when tmux env is missing: syncs existing session ID back to tmux.
+// Falls back to disk scanning for sessions started without a pre-generated ID
+// (e.g., -c/continue mode, -r/interactive resume).
 func (i *Instance) UpdateClaudeSession(excludeIDs map[string]bool) {
 	if !IsClaudeCompatible(i.Tool) {
 		return
@@ -4044,6 +4079,23 @@ func (i *Instance) UpdateClaudeSession(excludeIDs map[string]bool) {
 			}
 		}
 		i.ClaudeDetectedAt = time.Now()
+	} else if i.ClaudeSessionID != "" {
+		// Self-heal: tmux env is missing the session ID but we have one
+		// (from storage, hook, or disk sync). Sync it back to tmux so
+		// subsequent cycles take the fast path, and refresh detection time
+		// so fork/restart remain available.
+		if i.tmuxSession != nil && i.tmuxSession.Exists() {
+			_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", i.ClaudeSessionID)
+		}
+		i.ClaudeDetectedAt = time.Now()
+	} else {
+		// No tmux env AND no session ID. This happens for sessions started
+		// with -c (continue) or -r (interactive resume) where no session ID
+		// was pre-generated. Rate-limited disk scan to detect the session.
+		if i.lastDiskSessionSync.IsZero() || time.Since(i.lastDiskSessionSync) >= 10*time.Second {
+			i.lastDiskSessionSync = time.Now()
+			i.syncClaudeSessionFromDisk()
+		}
 	}
 
 	// Update latest prompt from JSONL file (tail-read with size caching)
@@ -6234,6 +6286,90 @@ func (i *Instance) Restart() error {
 	return nil
 }
 
+// HardRestart starts a completely fresh Claude session, discarding the old session ID.
+// Unlike Restart() which uses --resume to continue the conversation, HardRestart clears
+// the session identity and builds a new claude command (with a new UUID). This fully
+// reloads MCPs and starts with a clean conversation.
+// Only works for Claude-compatible tools.
+func (i *Instance) HardRestart() error {
+	if !IsClaudeCompatible(i.Tool) {
+		return fmt.Errorf("hard restart is only supported for Claude-compatible tools")
+	}
+
+	mcpLog.Debug(
+		"hard_restart_called",
+		slog.String("tool", i.Tool),
+		slog.String("old_claude_session_id", i.ClaudeSessionID),
+		slog.Bool("tmux_session", i.tmuxSession != nil),
+	)
+
+	// Clear session identity — this is the core difference from soft restart
+	i.ClaudeSessionID = ""
+	i.ClaudeDetectedAt = time.Time{}
+
+	// Regenerate .mcp.json before restart
+	skipRegen := i.SkipMCPRegenerate
+	i.SkipMCPRegenerate = false
+	if !skipRegen {
+		if err := i.regenerateMCPConfig(); err != nil {
+			mcpLog.Warn("hard_restart_mcp_regen_failed", slog.String("error", err.Error()))
+		}
+	}
+
+	// Kill old tmux session
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		mcpLog.Debug("hard_restart_killing_old_session", slog.String("session_name", i.tmuxSession.Name))
+		if killErr := i.tmuxSession.Kill(); killErr != nil {
+			mcpLog.Warn("hard_restart_kill_failed", slog.String("error", killErr.Error()))
+		}
+	}
+
+	// Create a fresh tmux session
+	i.tmuxSession = tmux.NewSession(i.Title, i.ProjectPath)
+	i.tmuxSession.InstanceID = i.ID
+	i.tmuxSession.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
+
+	// Build a fresh claude command (no --resume, new UUID)
+	command := i.buildClaudeCommand(i.Command)
+	command, containerName, err := i.prepareCommand(command)
+	if err != nil {
+		return err
+	}
+	if containerName != "" {
+		i.SandboxContainer = containerName
+	}
+
+	i.loadCustomPatternsFromConfig()
+	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
+	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed()
+
+	mcpLog.Debug("hard_restart_starting_new_session", slog.String("command", command))
+
+	if err := i.tmuxSession.Start(command); err != nil {
+		i.Status = StatusError
+		return fmt.Errorf("failed to hard restart tmux session: %w", err)
+	}
+
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_INSTANCE_ID", i.ID); err != nil {
+		sessionLog.Warn("set_instance_id_failed", slog.String("error", err.Error()))
+	}
+
+	// Propagate tool session IDs to tmux environment (host-side)
+	i.SyncSessionIDsToTmux()
+
+	i.CaptureLoadedMCPs()
+	i.lastStartTime = time.Now()
+
+	if command != "" {
+		i.Status = StatusWaiting
+	} else {
+		i.Status = StatusIdle
+	}
+
+	mcpLog.Debug("hard_restart_succeeded")
+	return nil
+}
+
 // RestartFresh restarts the current tool without resuming the existing tool session.
 // This recreates the tmux session and clears the stored tool session binding first,
 // so the next start gets a brand-new tool session ID.
@@ -6258,8 +6394,8 @@ func (i *Instance) RestartFresh() error {
 	return nil
 }
 
-// buildClaudeResumeCommand builds the claude resume command with proper config options
-// Respects: CLAUDE_CONFIG_DIR, dangerous_mode, and [shell].env_files + init_script
+// buildClaudeResumeCommand builds the Claude resume command with proper config options.
+// Respects: CLAUDE_CONFIG_DIR, use_happy, dangerous_mode, and [shell].env_files + init_script.
 // CLAUDE_SESSION_ID is set via host-side SetEnvironment (called by SyncSessionIDsToTmux after restart)
 func (i *Instance) buildClaudeResumeCommand() string {
 	// Source env files and init_script so resumed sessions have the same

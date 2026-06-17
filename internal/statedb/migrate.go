@@ -103,6 +103,13 @@ type toolDataBlob struct {
 	MultiRepoWorktrees []multiRepoWorktreeBlob `json:"multi_repo_worktrees,omitempty"`
 	// Presentation
 	Color string `json:"color,omitempty"` // issue #391 — per-session TUI row tint
+	// Priority (local fork): conductor-assigned Ctrl+E attention tier (1..3).
+	// Modeled here so MergeToolDataExtras treats it as an authoritative known
+	// key — letting an explicit clear (key absent in the new blob) win instead
+	// of carrying the stale value forward from the old row. The value itself
+	// is written/read via session.{Write,Read}PriorityToToolData against the
+	// raw blob; this field is never populated by the positional marshaler.
+	Priority int `json:"priority,omitempty"`
 }
 
 // multiRepoWorktreeBlob is the JSON representation of a multi-repo worktree in tool_data.

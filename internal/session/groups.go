@@ -201,6 +201,29 @@ func SortInstancesByActionable(insts []*Instance) {
 	})
 }
 
+// SortInstancesByOrder sorts in place into pin bands (pinZone) and orders every
+// band — including the normal band — by the persisted Order alone. Unlike
+// SortInstancesByActionable it NEVER sorts by status or recency, so the in-group
+// order is STABLE: rows don't shuffle as a session changes status or gets
+// attached. The group tree is rebuilt on every session reload, so an
+// actionable in-group sort re-runs constantly and makes rows jump out from
+// under the cursor right before a click.
+//
+// This is the fork's default in-group order (overrides upstream #857). The
+// "surface the actionable sessions" behavior #857 provided is still available
+// on demand via the active-on-top view mode (the 't' toggle), which floats
+// active sessions/groups to the top at render time without disturbing the
+// stable base order. (local fork)
+func SortInstancesByOrder(insts []*Instance) {
+	sort.SliceStable(insts, func(i, j int) bool {
+		zi, zj := pinZone(insts[i]), pinZone(insts[j])
+		if zi != zj {
+			return zi < zj
+		}
+		return insts[i].Order < insts[j].Order
+	})
+}
+
 // NewGroupTree creates a new group tree from instances
 func NewGroupTree(instances []*Instance) *GroupTree {
 	tree := &GroupTree{
@@ -236,12 +259,12 @@ func NewGroupTree(instances []*Instance) *GroupTree {
 		group.Sessions = append(group.Sessions, inst)
 	}
 
-	// Sort sessions within each group by actionability (issue #857).
-	// Persisted Order is preserved as the stable tie-breaker, so
-	// instances without a Status set behave identically to the prior
-	// Order-only sort.
+	// Sort sessions within each group by persisted Order (stable). The fork
+	// uses a stable in-group order so rows do not jump as statuses change; the
+	// actionable surfacing of #857 is available on demand via the active-on-top
+	// view mode. See SortInstancesByOrder. (local fork)
 	for _, group := range tree.Groups {
-		SortInstancesByActionable(group.Sessions)
+		SortInstancesByOrder(group.Sessions)
 	}
 
 	// Sort groups alphabetically and assign order
@@ -306,12 +329,12 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 		group.Sessions = append(group.Sessions, inst)
 	}
 
-	// Sort sessions within each group by actionability (issue #857).
-	// Persisted Order is preserved as the stable tie-breaker, so
-	// instances without a Status set behave identically to the prior
-	// Order-only sort.
+	// Sort sessions within each group by persisted Order (stable). The fork
+	// uses a stable in-group order so rows do not jump as statuses change; the
+	// actionable surfacing of #857 is available on demand via the active-on-top
+	// view mode. See SortInstancesByOrder. (local fork)
 	for _, group := range tree.Groups {
-		SortInstancesByActionable(group.Sessions)
+		SortInstancesByOrder(group.Sessions)
 	}
 
 	// Rebuild group list maintaining stored order

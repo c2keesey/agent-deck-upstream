@@ -359,6 +359,9 @@ func main() {
 		case "inbox":
 			handleInbox(args[1:])
 			return
+		case "idea":
+			handleIdea(profile, args[1:])
+			return
 		case "feedback":
 			handleFeedback(args[1:])
 			return
@@ -841,6 +844,16 @@ func main() {
 	ui.EnableModifyOtherKeys(os.Stdout)
 	defer ui.DisableModifyOtherKeys(os.Stdout)
 
+	// Reap orphaned control-mode clients left behind by prior crashed /
+	// SIGKILL'd / OOM-killed TUIs before this process starts connecting its
+	// own pipes. killStaleControlClients only sweeps per-session on Connect(),
+	// so orphans for sessions this TUI never reopens would otherwise pile up
+	// until they exhaust the pty table (observed: 176 orphaned `tmux -C`
+	// clients vs the macOS kern.tty.ptmx_max=511 cap, blocking all new
+	// terminals). This server-wide sweep clears the whole backlog once at
+	// startup; live sibling TUIs (allow_multiple=true) are preserved.
+	tmux.SweepStaleControlClients(tmux.DefaultSocketName())
+
 	p := tea.NewProgram(
 		homeModel,
 		tea.WithAltScreen(),
@@ -1172,8 +1185,8 @@ func handleAdd(profile string, args []string) {
 	// Worktree flags
 	worktreeBranch := fs.String("w", "", "Create session in git worktree for branch")
 	worktreeBranchLong := fs.String("worktree", "", "Create session in git worktree for branch")
-	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree)")
-	newBranchLong := fs.Bool("new-branch", false, "Create new branch")
+	newBranch := fs.Bool("b", false, "Create new branch if needed (reuse existing branch when present)")
+	newBranchLong := fs.Bool("new-branch", false, "Create new branch if needed (reuse existing branch when present)")
 	worktreeLocation := fs.String("location", "", "Worktree location: sibling, subdirectory, or custom path")
 
 	// MCP flag - can be specified multiple times
@@ -1903,7 +1916,8 @@ func handleList(profile string, args []string) {
 			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
 			Channels      []string  `json:"channels,omitempty"`
 			ExtraArgs     []string  `json:"extra_args,omitempty"`
-			Color         string    `json:"color,omitempty"` // issue #391
+			Color         string    `json:"color,omitempty"`    // issue #391
+			Priority      int       `json:"priority,omitempty"` // local fork: Ctrl+E tier
 		}
 		// Warm tmux pane-title cache + load hook statuses so the CLI
 		// reports the same Status the TUI and /api/menu do (issue #610).
@@ -1927,6 +1941,7 @@ func handleList(profile string, args []string) {
 				Channels:      inst.Channels,
 				ExtraArgs:     inst.ExtraArgs,
 				Color:         inst.Color,
+				Priority:      inst.Priority,
 			}
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 				sj.TmuxSession = tmuxSess.Name
@@ -1993,6 +2008,7 @@ func handleListAllProfiles(jsonOutput bool) {
 			CreatedAt     time.Time `json:"created_at"`
 			SSHHost       string    `json:"ssh_host,omitempty"`
 			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
+			Priority      int       `json:"priority,omitempty"` // local fork: Ctrl+E tier
 		}
 		var allSessions []sessionJSON
 
@@ -2017,6 +2033,7 @@ func handleListAllProfiles(jsonOutput bool) {
 					CreatedAt:     inst.CreatedAt,
 					SSHHost:       inst.SSHHost,
 					SSHRemotePath: inst.SSHRemotePath,
+					Priority:      inst.Priority,
 				})
 			}
 		}
@@ -3042,6 +3059,7 @@ func printHelp() {
 	fmt.Println("  add <path>       Add a new session")
 	fmt.Println("  launch [path]    Add, start, and optionally send a message in one step")
 	fmt.Println("  try <name>       Quick experiment (create/find dated folder + session)")
+	fmt.Println("  idea [text]      Capture an idea to the backlog (Ctrl+Alt+I inside a session)")
 	fmt.Println("  list, ls         List all sessions")
 	fmt.Println("  remove, rm       Remove a session")
 	fmt.Println("  rename, mv       Rename a session")

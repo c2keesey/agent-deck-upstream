@@ -180,6 +180,43 @@ func TestResolvedDetachByte(t *testing.T) {
 	}
 }
 
+func TestMRUCycleDefaultBinding(t *testing.T) {
+	// Local fork: the blind MRU cursor-cycle is unbound — Ctrl+W now opens the
+	// MRU-ordered session switcher (switch_session) instead.
+	bindings := resolveHotkeys(nil)
+	if got := bindings[hotkeyMRUCycle]; got != "" {
+		t.Fatalf("mru_cycle default binding = %q, want \"\" (replaced by switcher on ctrl+w)", got)
+	}
+	if got := bindings[hotkeySwitchSession]; got != "ctrl+w" {
+		t.Fatalf("switch_session default binding = %q, want ctrl+w", got)
+	}
+}
+
+func TestMRUCycleOverride(t *testing.T) {
+	bindings := resolveHotkeys(map[string]string{
+		"mru_cycle": "ctrl+o",
+	})
+	if got := bindings[hotkeyMRUCycle]; got != "ctrl+o" {
+		t.Fatalf("mru_cycle override binding = %q, want ctrl+o", got)
+	}
+}
+
+func TestMRUCycleUnbind(t *testing.T) {
+	bindings := resolveHotkeys(map[string]string{
+		"mru_cycle": "",
+	})
+	if _, ok := bindings[hotkeyMRUCycle]; ok {
+		t.Fatalf("mru_cycle should be unbound")
+	}
+}
+
+func TestMRUSwitchByte(t *testing.T) {
+	// Ctrl+W = byte 23
+	if got := DetachByteFromBinding("ctrl+w"); got != 23 {
+		t.Fatalf("DetachByteFromBinding(ctrl+w) = %d, want 23", got)
+	}
+}
+
 func TestNormalizeMainKeyWithConfiguredHotkeys(t *testing.T) {
 	h := NewHome()
 	h.setHotkeys(resolveHotkeys(map[string]string{

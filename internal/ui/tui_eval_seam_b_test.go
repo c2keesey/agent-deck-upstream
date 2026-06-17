@@ -151,6 +151,7 @@ func seamBNewHome() *Home {
 		mcpDialog:            NewMCPDialog(),
 		editPathsDialog:      NewEditPathsDialog(),
 		skillDialog:          NewSkillDialog(),
+		ideaDialog:           NewIdeaDialog(),
 		setupWizard:          NewSetupWizard(),
 		settingsPanel:        NewSettingsPanel(),
 		analyticsPanel:       NewAnalyticsPanel(),

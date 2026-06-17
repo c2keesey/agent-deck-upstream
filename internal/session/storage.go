@@ -145,6 +145,9 @@ type InstanceData struct {
 
 	// IdleTimeoutSecs mirrors Instance.IdleTimeoutSecs (#1143). 0 = disabled.
 	IdleTimeoutSecs int64 `json:"idle_timeout_secs,omitempty"`
+
+	// Priority mirrors Instance.Priority (local fork). 0 = unset, 1..3.
+	Priority int `json:"priority,omitempty"`
 }
 
 // GroupData represents serializable group data
@@ -719,6 +722,8 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// the positional MarshalToolData signature so legacy binaries that don't
 	// know the key preserve it via MergeToolDataExtras.
 	toolData = WriteIdleTimeoutSecsToToolData(toolData, inst.IdleTimeoutSecs)
+	// Priority (local fork) rides the same extras zone as idle_timeout_secs.
+	toolData = WritePriorityToToolData(toolData, inst.Priority)
 
 	return &statedb.InstanceRow{
 		ID:                  inst.ID,
@@ -890,6 +895,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			AutoLinkedChannels:        autoLinkedChannels2,
 			Color:                     color2,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
+			Priority:                  ReadPriorityFromToolData(r.ToolData),
 		}
 	}
 
@@ -1009,6 +1015,7 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			AutoLinkedChannels:        autoLinkedChannels,
 			Color:                     color,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
+			Priority:                  ReadPriorityFromToolData(r.ToolData),
 		}
 	}
 
@@ -1255,6 +1262,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			AutoLinkedChannels:        instData.AutoLinkedChannels,
 			Color:                     instData.Color,
 			IdleTimeoutSecs:           instData.IdleTimeoutSecs,
+			Priority:                  instData.Priority,
 			Sandbox:                   instData.Sandbox,
 			SandboxContainer:          instData.SandboxContainer,
 			SSHHost:                   instData.SSHHost,

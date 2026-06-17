@@ -237,6 +237,7 @@ type dialogSnapshot struct {
 	claudeOptions    *session.ClaudeOptions
 	geminiYolo       bool
 	codexYolo        bool
+	codexHappy       bool
 	hermesYolo       bool
 	multiRepoEnabled bool
 	multiRepoPaths   []string
@@ -369,9 +370,9 @@ func NewNewDialog() *NewDialog {
 		branchInput:     branchInput,
 		branchPicker:    NewBranchPickerDialog(),
 		claudeOptions:   NewClaudeOptionsPanel(),
-		geminiOptions:   NewYoloOptionsPanel("Gemini", "YOLO mode - auto-approve all"),
-		codexOptions:    NewYoloOptionsPanel("Codex", "YOLO mode - bypass approvals and sandbox"),
-		hermesOptions:   NewYoloOptionsPanel("Hermes", "YOLO mode - auto-approve all tool calls"),
+		geminiOptions:   NewYoloOptionsPanel("Gemini", "YOLO mode - auto-approve all", false),
+		codexOptions:    NewYoloOptionsPanel("Codex", "YOLO mode - bypass approvals and sandbox", false),
+		hermesOptions:   NewYoloOptionsPanel("Hermes", "YOLO mode - auto-approve all tool calls", false),
 		focusIndex:      0,
 		visible:         false,
 		presetCommands:  buildPresetCommands(),
@@ -744,6 +745,7 @@ func (d *NewDialog) saveSnapshot() *dialogSnapshot {
 		claudeOptions:    claudeOpts,
 		geminiYolo:       d.geminiOptions.GetYoloMode(),
 		codexYolo:        d.codexOptions.GetYoloMode(),
+		codexHappy:       d.codexOptions.GetUseHappy(),
 		hermesYolo:       d.hermesOptions.GetYoloMode(),
 		multiRepoEnabled: d.multiRepoEnabled,
 		multiRepoPaths:   append([]string{}, d.multiRepoPaths...),
@@ -767,7 +769,7 @@ func (d *NewDialog) restoreSnapshot(s *dialogSnapshot) {
 		d.claudeOptions.SetFromOptions(s.claudeOptions)
 	}
 	d.geminiOptions.SetDefaults(s.geminiYolo)
-	d.codexOptions.SetDefaults(s.codexYolo)
+	d.codexOptions.SetDefaults(s.codexYolo, s.codexHappy)
 	d.hermesOptions.SetDefaults(s.hermesYolo)
 	d.multiRepoEnabled = s.multiRepoEnabled
 	d.multiRepoPaths = append([]string{}, s.multiRepoPaths...)

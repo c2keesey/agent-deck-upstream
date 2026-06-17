@@ -195,8 +195,10 @@ func TestIssue1353_LocalNUnaffected(t *testing.T) {
 	home.pendingRemoteName = "stale-remote"
 
 	h := pressN(t, home)
-	if !h.newDialog.IsVisible() {
-		t.Fatal("n on a local group must open the dialog")
+	// Local fork: 'n' opens the MAIA worker picker (not the full NewDialog),
+	// but the #1353 invariant still holds — the stale remote target is cleared.
+	if !h.maiaWorkerPicker.IsVisible() {
+		t.Fatal("n on a local group must open the MAIA worker picker")
 	}
 	if h.pendingRemoteName != "" {
 		t.Fatalf("n on a local group must clear pendingRemoteName, got %q", h.pendingRemoteName)

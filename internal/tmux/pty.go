@@ -20,6 +20,25 @@ import (
 	"golang.org/x/term"
 )
 
+// ErrMRUSwitch is returned by Attach when the user presses the MRU switch key
+// instead of the detach key. The caller should switch to the previous session.
+var ErrMRUSwitch = fmt.Errorf("mru switch requested")
+
+// ErrAttentionSwitch is returned by Attach when the user presses the attention
+// switch key (Ctrl+E by default). The caller should switch to the highest
+// priority session that is ready to be picked back up. (local fork)
+var ErrAttentionSwitch = fmt.Errorf("attention switch requested")
+
+// switchKind distinguishes the three ways Attach can hand control back to the
+// TUI: a normal detach, an MRU switch, or an attention switch.
+type switchKind int
+
+const (
+	switchDetach switchKind = iota
+	switchMRU
+	switchAttention
+)
+
 const attachOutputDrainTimeout = 250 * time.Millisecond
 
 // attachReplyQuarantine is how long after attach/detach we filter
@@ -66,6 +85,15 @@ func IndexCtrlQ(data []byte) int {
 	return IndexDetachKey(data, 17)
 }
 
+// AttachOpts configures the legacy AttachWithOpts call (local fork). It is kept
+// as a thin compatibility shim over AttachOptions so the MRU/attention switch
+// keys (which signal via ErrMRUSwitch / ErrAttentionSwitch) keep working.
+type AttachOpts struct {
+	DetachByte         byte // default 0x11 (Ctrl+Q)
+	MRUSwitchKey       byte // if non-zero, this key triggers ErrMRUSwitch instead of detach
+	AttentionSwitchKey byte // if non-zero, this key triggers ErrAttentionSwitch instead of detach (local fork)
+}
+
 // SwitchIntent reports whether the attach loop handed control back to the
 // caller to open the in-attach session switcher.
 type SwitchIntent int
@@ -90,6 +118,10 @@ type AttachOptions struct {
 	// that is not reliably available during attach, so a control byte is the
 	// only portable trigger (the cycling/commit UX then lives in the TUI).
 	SwitchKeyByte byte
+	// Local fork: extra interrupt keys handled via the error channel
+	// (ErrMRUSwitch / ErrAttentionSwitch) rather than SwitchIntent. 0 disables.
+	MRUSwitchKey       byte
+	AttentionSwitchKey byte
 }
 
 // indexSwitchKey returns the index of the switch key in data and
@@ -184,15 +216,32 @@ func (s *Session) Attach(ctx context.Context, detachByte ...byte) error {
 	return err
 }
 
+// AttachWithOpts is the local-fork compatibility shim: it forwards to
+// AttachWithOptions and discards the SwitchIntent, so callers that rely on the
+// MRU/attention switch keys (signalled via ErrMRUSwitch / ErrAttentionSwitch)
+// keep their error-based contract.
+func (s *Session) AttachWithOpts(ctx context.Context, opts AttachOpts) error {
+	_, err := s.AttachWithOptions(ctx, AttachOptions{
+		DetachByte:         opts.DetachByte,
+		MRUSwitchKey:       opts.MRUSwitchKey,
+		AttentionSwitchKey: opts.AttentionSwitchKey,
+	})
+	return err
+}
+
 // AttachWithOptions attaches to the tmux session with full PTY support and the
 // session-switch keys configured in opts. It returns the SwitchIntent the user
 // requested (SwitchNone on a normal detach or when the pane process exits) so
-// the caller can open an in-attach session switcher.
+// the caller can open an in-attach session switcher. The local-fork MRU and
+// attention switch keys are signalled separately via ErrMRUSwitch /
+// ErrAttentionSwitch on the returned error.
 func (s *Session) AttachWithOptions(ctx context.Context, opts AttachOptions) (SwitchIntent, error) {
 	detach := byte(17) // Ctrl+Q default
 	if opts.DetachByte != 0 {
 		detach = opts.DetachByte
 	}
+	mruSwitch := opts.MRUSwitchKey
+	attentionSwitch := opts.AttentionSwitchKey
 
 	if !s.Exists() {
 		return SwitchNone, fmt.Errorf("session %s does not exist", s.Name)
@@ -317,11 +366,12 @@ func (s *Session) AttachWithOptions(ctx context.Context, opts AttachOptions) (Sw
 	// Initial resize
 	sigwinch <- syscall.SIGWINCH
 
-	// Channel to signal detach
-	detachCh := make(chan struct{})
+	// Channel to signal detach via configured detach key.
+	// Carries the switchKind: normal detach, MRU switch, or attention switch.
+	detachCh := make(chan switchKind, 1)
 
-	// switchOutcome is written by the stdin goroutine before it closes
-	// detachCh when a session-switch key is pressed. The close establishes a
+	// switchOutcome is written by the stdin goroutine before it sends on
+	// detachCh when a session-switch key is pressed. The send establishes a
 	// happens-before edge, so the main goroutine can read it after <-detachCh
 	// without additional synchronization. It stays SwitchNone for a plain
 	// detach or a pane-process exit.
@@ -331,7 +381,12 @@ func (s *Session) AttachWithOptions(ctx context.Context, opts AttachOptions) (Sw
 	ioErrors := make(chan error, 2)
 
 	startTime := time.Now()
-	const terminalStyleReset = "\x1b]8;;\x1b\\\x1b[0m\x1b[24m\x1b[39m\x1b[49m"
+	// Reset OSC-8, SGR attributes, AND fully disable all mouse modes before
+	// Bubble Tea re-enables mouse reporting. Without this, tmux detach can leave
+	// mouse state dirty, causing Shift to trigger text selection instead of
+	// sending Shift+key to the application.
+	const terminalStyleReset = "\x1b]8;;\x1b\\\x1b[0m\x1b[24m\x1b[39m\x1b[49m" +
+		"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" // disable all mouse modes
 	outputDone := make(chan struct{})
 
 	// Goroutine 1: Copy PTY output to stdout
@@ -382,6 +437,43 @@ func (s *Session) AttachWithOptions(ctx context.Context, opts AttachOptions) (Sw
 				continue
 			}
 
+			// Local fork: MRU / attention switch keys are checked first and
+			// signal via the detachCh switchKind (→ ErrMRUSwitch /
+			// ErrAttentionSwitch), independent of upstream's SwitchIntent path.
+			if mruSwitch != 0 {
+				if idx := IndexDetachKey(buf[:n], mruSwitch); idx >= 0 {
+					if idx > 0 {
+						if _, err := ptmx.Write(buf[:idx]); err != nil {
+							select {
+							case ioErrors <- fmt.Errorf("PTY write error: %w", err):
+							default:
+							}
+							return
+						}
+					}
+					detachCh <- switchMRU
+					cancel()
+					return
+				}
+			}
+
+			if attentionSwitch != 0 {
+				if idx := IndexDetachKey(buf[:n], attentionSwitch); idx >= 0 {
+					if idx > 0 {
+						if _, err := ptmx.Write(buf[:idx]); err != nil {
+							select {
+							case ioErrors <- fmt.Errorf("PTY write error: %w", err):
+							default:
+							}
+							return
+						}
+					}
+					detachCh <- switchAttention
+					cancel()
+					return
+				}
+			}
+
 			// Check for the detach key and any session-switch keys anywhere in
 			// the input chunk. Some terminals coalesce reads, so these must not
 			// require a single-byte read. Handles raw byte, xterm
@@ -417,7 +509,11 @@ func (s *Session) AttachWithOptions(ctx context.Context, opts AttachOptions) (Sw
 				if isSwitch {
 					switchOutcome = switchIn
 				}
-				close(detachCh)
+				// Send switchDetach (the switchKind zero value) rather than
+				// closing: a buffered send is the same happens-before edge for
+				// switchOutcome, and it keeps the channel's signalling uniform
+				// with the local MRU/attention sends above.
+				detachCh <- switchDetach
 				cancel()
 				return
 			}
@@ -480,10 +576,17 @@ func (s *Session) AttachWithOptions(ctx context.Context, opts AttachOptions) (Sw
 	// Wait for either detach or command completion
 	var attachErr error
 	select {
-	case <-detachCh:
-		// User pressed the detach key, detach gracefully
+	case kind := <-detachCh:
+		// User pressed the detach key (or a switch key), detach gracefully.
 		didDetach = true
-		attachErr = nil
+		switch kind {
+		case switchMRU:
+			attachErr = ErrMRUSwitch
+		case switchAttention:
+			attachErr = ErrAttentionSwitch
+		default:
+			attachErr = nil
+		}
 	case err := <-cmdDone:
 		if err != nil {
 			// Check if it's a normal exit (tmux detach via Ctrl+B,D)

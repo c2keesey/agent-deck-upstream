@@ -67,6 +67,11 @@ func TestSettingsPanel_LoadConfig(t *testing.T) {
 		Claude: session.ClaudeSettings{
 			DangerousMode: &dangerousModeBool,
 			ConfigDir:     "~/.claude-work",
+			UseHappy:      true,
+		},
+		Codex: session.CodexSettings{
+			UseHappy: true,
+			YoloMode: true,
 		},
 		Updates: session.UpdateSettings{
 			CheckEnabled: boolPtr(false),
@@ -93,6 +98,9 @@ func TestSettingsPanel_LoadConfig(t *testing.T) {
 	}
 	if panel.claudeConfigDir != "~/.claude-work" {
 		t.Errorf("claudeConfigDir: got %q, want %q", panel.claudeConfigDir, "~/.claude-work")
+	}
+	if !panel.codexYoloMode {
+		t.Error("codexYoloMode should be true")
 	}
 	if panel.checkForUpdates {
 		t.Error("checkForUpdates should be false")
@@ -250,6 +258,7 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	panel.selectedTool = toolValueIndex(t, panel, "opencode")
 	panel.dangerousMode = true
 	panel.claudeConfigDir = "~/.claude-custom"
+	panel.codexYoloMode = true
 	panel.checkForUpdates = false
 	panel.autoUpdate = true
 	panel.logMaxSizeMB = 15
@@ -269,6 +278,11 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	}
 	if config.Claude.ConfigDir != "~/.claude-custom" {
 		t.Errorf("ConfigDir: got %q, want %q", config.Claude.ConfigDir, "~/.claude-custom")
+	}
+	// Personal fork note: the "happy wrapper" toggle was removed from the
+	// settings panel upstream, so GetConfig no longer populates UseHappy.
+	if !config.Codex.YoloMode {
+		t.Error("Codex.YoloMode should be true")
 	}
 	if config.Updates.GetCheckEnabled() {
 		t.Error("CheckEnabled should be false")

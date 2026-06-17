@@ -75,45 +75,6 @@ func TestSessionRemoveTUI_CapitalX_OnRunning_ShowsError(t *testing.T) {
 	}
 }
 
-// TestSessionRemoveTUI_CtrlX_OpensBulkConfirmWithCount — Ctrl+X routes to
-// the bulk-errored dialog and passes the correct count.
-func TestSessionRemoveTUI_CtrlX_OpensBulkConfirmWithCount(t *testing.T) {
-	h := newSeamATestHome()
-	h.instances = []*session.Instance{
-		{ID: "e1", Title: "err-1", Status: session.StatusError},
-		{ID: "e2", Title: "err-2", Status: session.StatusError},
-		{ID: "ok", Title: "running", Status: session.StatusRunning},
-	}
-
-	newModel, _ := h.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	got := newModel.(*Home)
-
-	if !got.confirmDialog.IsVisible() {
-		t.Fatalf("confirm dialog should be visible after Ctrl+X")
-	}
-	if got.confirmDialog.GetConfirmType() != ConfirmBulkRemoveErrored {
-		t.Fatalf("expected ConfirmBulkRemoveErrored, got %v", got.confirmDialog.GetConfirmType())
-	}
-	// mcpCount is reused by the dialog as a generic integer carrier for the bulk count.
-	if got.confirmDialog.mcpCount != 2 {
-		t.Fatalf("expected bulk count 2, got %d", got.confirmDialog.mcpCount)
-	}
-}
-
-// TestSessionRemoveTUI_CtrlX_NoErrored_ShowsError — empty-set guard.
-func TestSessionRemoveTUI_CtrlX_NoErrored_ShowsError(t *testing.T) {
-	h := newSeamATestHome()
-	h.instances = []*session.Instance{
-		{ID: "ok", Title: "idle-one", Status: session.StatusIdle},
-	}
-
-	newModel, _ := h.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
-	got := newModel.(*Home)
-
-	if got.confirmDialog.IsVisible() {
-		t.Fatalf("confirm dialog should NOT open when there are no errored sessions")
-	}
-	if got.err == nil {
-		t.Fatalf("expected an error message when no errored sessions exist")
-	}
-}
+// Personal fork: upstream's Ctrl+X "bulk-remove all errored sessions" was
+// dropped here — Ctrl+X is remapped to "close session" in the local hotkey
+// scheme, so the bulk-remove tests (and bulkRemoveErrored) were removed.

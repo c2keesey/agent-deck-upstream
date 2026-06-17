@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/docker"
 	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/ideas"
 	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/safego"
@@ -240,6 +242,7 @@ type Home struct {
 	editPathsDialog      *EditPathsDialog      // For editing multi-repo paths
 	editSessionDialog    *EditSessionDialog    // For editing session settings (title/color/notes/command/...)
 	skillDialog          *SkillDialog          // For managing project skills
+	ideaDialog           *IdeaDialog           // Capture a "by the way" idea from the dashboard (local fork)
 	setupWizard          *SetupWizard          // For first-run setup
 	settingsPanel        *SettingsPanel        // For editing settings
 	analyticsPanel       *AnalyticsPanel       // For displaying session analytics
@@ -251,6 +254,8 @@ type Home struct {
 	worktreeFinishDialog *WorktreeFinishDialog // For finishing worktree sessions (merge + cleanup)
 	feedbackDialog       *FeedbackDialog       // For in-app feedback popup (Phase 2)
 	zoxidePicker         *ZoxidePicker         // Quick-open picker backed by the zoxide DB
+	maiaWorkerPicker     *MaiaWorkerPicker     // Simple new-session picker scoped to MAIA worktrees (replaces 'n' dialog)
+	personalPicker       *PersonalPicker       // 'n' picker for the personal profile (~/Projects, home, optiplex ssh)
 	feedbackState        *feedback.State       // Loaded at first show, avoids repeated disk I/O
 	feedbackSender       *feedback.Sender      // Sender constructed once in NewHome (Phase 3, per D-05)
 	watcherPanel         *WatcherPanel         // For showing watcher status and events
@@ -278,16 +283,18 @@ type Home struct {
 	analyticsCacheTime     map[string]time.Time                       // TTL cache: sessionID -> cache timestamp
 
 	// State
-	cursor              int                   // Selected item index in flatItems
-	viewOffset          int                   // First visible item index (for scrolling)
-	previewScrollOffset int                   // Lines scrolled up from tail in the preview pane (#574). 0 = tail (default). Reset on cursor move.
-	isAttaching         atomic.Bool           // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
-	statusFilter        session.Status        // Filter sessions by status ("" = all, or specific status)
-	groupScope          string                // Limit TUI to a specific group path ("" = all groups)
-	initialSelect       string                // Session ID or title to preselect on first load (#709). Does NOT scope groups.
-	initialSelectDone   bool                  // Guard so preselection only fires once
-	previewMode         PreviewMode           // What to show in preview pane (both, output-only, analytics-only)
-	groupViewMode       session.GroupViewMode // List partition: normal, active-on-top, populated-on-top (cycled by hotkey 't')
+	cursor              int                     // Selected item index in flatItems
+	viewOffset          int                     // First visible item index (for scrolling)
+	primaryColCells     int                     // Per-render width of the primary-label column (aligns the worktree chip into a table)
+	primaryLabels       map[string]primaryLabel // Per-render chosen identity label per session ID (dynamic precedence)
+	previewScrollOffset int                     // Lines scrolled up from tail in the preview pane (#574). 0 = tail (default). Reset on cursor move.
+	isAttaching         atomic.Bool             // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
+	statusFilter        session.Status          // Filter sessions by status ("" = all, or specific status)
+	groupScope          string                  // Limit TUI to a specific group path ("" = all groups)
+	initialSelect       string                  // Session ID or title to preselect on first load (#709). Does NOT scope groups.
+	initialSelectDone   bool                    // Guard so preselection only fires once
+	previewMode         PreviewMode             // What to show in preview pane (both, output-only, analytics-only)
+	groupViewMode       session.GroupViewMode   // List partition: normal, active-on-top, populated-on-top (cycled by hotkey 't')
 	err                 error
 	errTime             time.Time  // When error occurred (for auto-dismiss)
 	isReloading         bool       // Visual feedback during auto-reload
@@ -507,6 +514,20 @@ type Home struct {
 	lastNotifSwitchID string
 	lastNotifSwitchMu sync.Mutex
 
+	// MRU session cycling (alt-tab style)
+	mruCycleIndex      int                 // Current position in the MRU list
+	mruCycleSnapshot   []*session.Instance // Frozen MRU list during a switch chain
+	mruCycleOrigin     string              // Session ID where the chain started
+	mruCycleLastSwitch time.Time           // When the last Ctrl+W was pressed
+
+	// Attention (priority) cycling — Ctrl+E. Mirrors the MRU chain machinery
+	// but snapshots sessions that are READY to be picked back up (waiting/idle)
+	// ordered by conductor-assigned priority, then longest-waiting. (local fork)
+	attentionCycleIndex      int
+	attentionCycleSnapshot   []*session.Instance
+	attentionCycleOrigin     string
+	attentionCycleLastSwitch time.Time
+
 	// Undo delete stack (Chrome-style: Ctrl+Z restores in reverse order)
 	undoStack []deletedSessionEntry
 
@@ -673,9 +694,28 @@ func (h *Home) detachByte() byte {
 	return ResolvedDetachByte(session.GetHotkeyOverrides())
 }
 
+func (h *Home) mruSwitchByte() byte {
+	bindings := resolveHotkeys(session.GetHotkeyOverrides())
+	key := actionHotkey(bindings, hotkeyMRUCycle)
+	if key == "" {
+		return 0
+	}
+	return DetachByteFromBinding(key)
+}
+
+func (h *Home) attentionSwitchByte() byte {
+	bindings := resolveHotkeys(session.GetHotkeyOverrides())
+	key := actionHotkey(bindings, hotkeyAttentionCycle)
+	if key == "" {
+		return 0
+	}
+	return DetachByteFromBinding(key)
+}
+
 // attachOptions resolves the detach key plus the in-attach session-switcher
-// key for the current hotkey configuration. The detach key always wins: a
-// switch byte that collides with it is dropped so it can never shadow detach.
+// key for the current hotkey configuration, and the local-fork MRU/attention
+// switch keys. The detach key always wins: a switch byte that collides with it
+// is dropped so it can never shadow detach.
 func (h *Home) attachOptions() tmux.AttachOptions {
 	overrides := session.GetHotkeyOverrides()
 	detach := ResolvedDetachByte(overrides)
@@ -683,7 +723,12 @@ func (h *Home) attachOptions() tmux.AttachOptions {
 	if switchByte == detach {
 		switchByte = 0
 	}
-	return tmux.AttachOptions{DetachByte: detach, SwitchKeyByte: switchByte}
+	return tmux.AttachOptions{
+		DetachByte:         detach,
+		SwitchKeyByte:      switchByte,
+		MRUSwitchKey:       h.mruSwitchByte(),
+		AttentionSwitchKey: h.attentionSwitchByte(),
+	}
 }
 
 func (h *Home) setHotkeys(bindings map[string]string) {
@@ -876,8 +921,10 @@ type sessionForkedMsg struct {
 type refreshMsg struct{}
 
 type statusUpdateMsg struct {
-	attachedSessionID string // Session that just returned from attach (if local attach)
-	attachedWorkDir   string // pane_current_path captured after attach returns
+	attachedSessionID   string // Session that just returned from attach (if local attach)
+	attachedWorkDir     string // pane_current_path captured after attach returns
+	mruSwitchFrom       string // If non-empty, MRU switch was requested from this session
+	attentionSwitchFrom string // If non-empty, attention (Ctrl+E) switch was requested from this session (local fork)
 } // Triggers immediate status update without reloading
 
 // openSwitcherMsg is emitted when the user pressed the session-switch key while
@@ -968,6 +1015,17 @@ type sendOutputResultMsg struct {
 	targetTitle string
 	lineCount   int
 	err         error
+}
+
+// teardownResultMsg is sent when the async teardown send sequence completes.
+// On success id is the session to delete; the handler re-resolves it by ID so a
+// storage reload during the (minutes-long) teardown can't make us delete a
+// stale pointer.
+type teardownResultMsg struct {
+	title string
+	id    string
+	warn  string // non-fatal cleanup failure (gr/make down) — still deletes
+	err   error  // setup failure (no working dir) — aborts deletion
 }
 
 // remoteSessionsFetchedMsg is sent when async remote sessions fetch completes.
@@ -1092,6 +1150,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		editPathsDialog:           NewEditPathsDialog(),
 		editSessionDialog:         NewEditSessionDialog(),
 		skillDialog:               NewSkillDialog(),
+		ideaDialog:                NewIdeaDialog(),
 		setupWizard:               NewSetupWizard(),
 		settingsPanel:             NewSettingsPanel(),
 		analyticsPanel:            NewAnalyticsPanel(),
@@ -1103,6 +1162,8 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		worktreeFinishDialog:      NewWorktreeFinishDialog(),
 		feedbackDialog:            NewFeedbackDialog(),
 		zoxidePicker:              NewZoxidePicker(),
+		maiaWorkerPicker:          NewMaiaWorkerPicker(),
+		personalPicker:            NewPersonalPicker(),
 		feedbackSender:            feedback.NewSender(),
 		watcherPanel:              NewWatcherPanel(),
 		toolVisibilityPanel:       NewToolVisibilityPanel(),
@@ -1779,6 +1840,154 @@ func (h *Home) moveCursorToGroup(path string) {
 			return
 		}
 	}
+}
+
+// mruSortedSessions returns all sessions sorted by LastAccessedAt (most recent first).
+// Sessions that have never been accessed are sorted to the end by creation order.
+func (h *Home) mruSortedSessions() []*session.Instance {
+	h.instancesMu.RLock()
+	result := make([]*session.Instance, len(h.instances))
+	copy(result, h.instances)
+	h.instancesMu.RUnlock()
+
+	sort.SliceStable(result, func(i, j int) bool {
+		ti := result[i].LastAccessedAt
+		tj := result[j].LastAccessedAt
+		// Both accessed: most recent first
+		if !ti.IsZero() && !tj.IsZero() {
+			return ti.After(tj)
+		}
+		// Accessed beats never-accessed
+		if !ti.IsZero() {
+			return true
+		}
+		return false
+	})
+	return result
+}
+
+// attentionReadySince reports when a session became ready to be picked back up.
+// Prefers the waiting transition time (when it started blocking on the user);
+// falls back to last-accessed for idle/finished sessions with no waiting stamp.
+func attentionReadySince(inst *session.Instance) time.Time {
+	if ws := inst.GetWaitingSince(); !ws.IsZero() {
+		return ws
+	}
+	return inst.LastAccessedAt
+}
+
+// attentionSortedSessions returns the sessions that are READY to be picked back
+// up — status waiting (blocked on the user) or idle (finished its turn) — sorted
+// by conductor-assigned priority (1 highest .. 3; unset/0 last), then by
+// longest-waiting first. running sessions are excluded: there's nothing for the
+// user to do on them yet. This is the order Ctrl+E cycles through. (local fork)
+func (h *Home) attentionSortedSessions() []*session.Instance {
+	h.instancesMu.RLock()
+	all := make([]*session.Instance, len(h.instances))
+	copy(all, h.instances)
+	h.instancesMu.RUnlock()
+
+	result := make([]*session.Instance, 0, len(all))
+	for _, inst := range all {
+		if inst == nil {
+			continue
+		}
+		if inst.Status == session.StatusWaiting || inst.Status == session.StatusIdle {
+			result = append(result, inst)
+		}
+	}
+
+	// Rank key for priority: 1..3 keep their value; unset (0) sorts last.
+	rank := func(p int) int {
+		if p <= 0 {
+			return session.MaxPriority + 1
+		}
+		return p
+	}
+
+	sort.SliceStable(result, func(i, j int) bool {
+		ri, rj := rank(result[i].Priority), rank(result[j].Priority)
+		if ri != rj {
+			return ri < rj // higher priority (lower number) first
+		}
+		// Same priority tier: the one ready longest comes first.
+		ti, tj := attentionReadySince(result[i]), attentionReadySince(result[j])
+		if ti.IsZero() != tj.IsZero() {
+			return !ti.IsZero() // a real timestamp beats an unknown one
+		}
+		return ti.Before(tj)
+	})
+	return result
+}
+
+// attentionPriorityRank maps a priority to a sortable rank where lower is more
+// important and unset (0) sorts last. (local fork)
+func attentionPriorityRank(p int) int {
+	if p <= 0 {
+		return session.MaxPriority + 1
+	}
+	return p
+}
+
+// attentionNudgeText returns a one-line status-bar nudge when a session of
+// strictly higher priority than the currently-attached one is ready to be
+// picked back up (waiting/idle). Empty when nothing more important is ready, or
+// when not attached (attachedID == "") — in the list view the board already
+// shows everything, so a bar nudge would be noise. (local fork)
+func (h *Home) attentionNudgeText(attachedID string, instances []*session.Instance) string {
+	if attachedID == "" {
+		return ""
+	}
+	attachedRank := attentionPriorityRank(0)
+	for _, inst := range instances {
+		if inst != nil && inst.ID == attachedID {
+			attachedRank = attentionPriorityRank(inst.Priority)
+			break
+		}
+	}
+
+	var best *session.Instance
+	for _, inst := range instances {
+		if inst == nil || inst.ID == attachedID || inst.Priority <= 0 {
+			continue
+		}
+		st := inst.GetStatusThreadSafe()
+		if st != session.StatusWaiting && st != session.StatusIdle {
+			continue
+		}
+		if attentionPriorityRank(inst.Priority) >= attachedRank {
+			continue // not strictly higher than where the user already is
+		}
+		if best == nil || attentionPriorityRank(inst.Priority) < attentionPriorityRank(best.Priority) {
+			best = inst
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return fmt.Sprintf("⚡ P%d %s ready — ^E", best.Priority, best.Title)
+}
+
+// styledNudgeBar wraps the plain attention nudge in tmux status-left format
+// codes so the higher-priority-ready alert reads as a bold, filled, color-tiered
+// bar instead of blending into the surrounding notification text. The tiers
+// mirror the dashboard priority chip — P1 red, P2 orange, P3 yellow — and the
+// trailing #[default] resets styling so the appended FormatBar text is
+// unaffected. Empty in → empty out. (local fork)
+func styledNudgeBar(plain string) string {
+	if plain == "" {
+		return ""
+	}
+	// Tier color keyed off the "P<n>" the plain text already carries. Default
+	// to the P3 tier for any unexpected shape so the alert still stands out.
+	style := "#[fg=#1a1b26,bg=#e0af68,bold]" // P3: dark on yellow
+	switch {
+	case strings.Contains(plain, " P1 "):
+		style = "#[fg=#ffffff,bg=#f7768e,bold]" // P1: white on red
+	case strings.Contains(plain, " P2 "):
+		style = "#[fg=#1a1b26,bg=#ff9e64,bold]" // P2: dark on orange
+	}
+	return style + " " + plain + " #[default]"
 }
 
 func (h *Home) captureSelectedItemIdentity() selectedItemIdentity {
@@ -3391,6 +3600,7 @@ type sessionRenderState struct {
 	substate  session.Substate // Honest Status v2: additive refinement (model-unavailable, auth-401, ...)
 	tool      string
 	paneTitle string // Current task description from tmux pane title (stripped of spinner/done markers)
+	branch    string // Current git branch of the session's ProjectPath (empty if not a repo / detached)
 }
 
 // displaySessionTitle returns the label to render for a session row. For an
@@ -3501,6 +3711,11 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 				}
 			}
 		}
+		// Branch lookup is cached per-path with a short TTL — refreshing
+		// every snapshot tick (a few seconds) is enough since branches
+		// change rarely. Reads .git/HEAD directly to avoid spawning a
+		// git subprocess per session.
+		state.branch = cachedGitBranch(inst.EffectiveWorkingDir())
 		snap[inst.ID] = state
 	}
 	h.sessionRenderSnapshot.Store(snap)
@@ -4054,6 +4269,18 @@ func (h *Home) syncNotificationsBackground() {
 	// Update tmux status bar directly
 	barText := h.notificationManager.FormatBar()
 
+	// Local fork: when attached, prefix a priority nudge if a strictly
+	// higher-priority session is ready to be picked back up. This is the piece
+	// that pulls the user off lower-priority work the moment the important
+	// thread is ready — Ctrl+E then jumps straight to it.
+	if nudge := styledNudgeBar(h.attentionNudgeText(currentSessionID, instances)); nudge != "" {
+		if barText == "" {
+			barText = nudge
+		} else {
+			barText = nudge + "  " + barText
+		}
+	}
+
 	// Only update if changed (avoid unnecessary tmux calls)
 	h.lastBarTextMu.Lock()
 	if barText != h.lastBarText {
@@ -4381,6 +4608,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		h.geminiModelDialog.SetSize(msg.Width, msg.Height)
 		h.promptInputDialog.SetSize(msg.Width, msg.Height)
+		h.ideaDialog.SetSize(msg.Width, msg.Height)
 		// Issue #1366: a resize can reveal the preview pane (single -> stacked/dual).
 		// fetchSelectedPreview self-guards to nil in single-column, so this only
 		// fetches when a preview pane is actually visible.
@@ -5430,10 +5658,83 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		reloading := h.isReloading
 		h.reloadMu.Unlock()
 		if reloading {
-			return h, tea.EnableMouseCellMotion
+			return h, tea.Sequence(tea.DisableMouse, tea.EnableMouseCellMotion)
 		}
 
 		h.followAttachReturnCwd(msg)
+
+		// Reset MRU chain on normal detach (not an MRU switch)
+		if msg.mruSwitchFrom == "" {
+			h.mruCycleSnapshot = nil
+			h.mruCycleOrigin = ""
+			h.mruCycleIndex = 0
+			h.mruCycleLastSwitch = time.Time{}
+		}
+
+		// Reset attention chain on anything that isn't an attention switch.
+		if msg.attentionSwitchFrom == "" {
+			h.attentionCycleSnapshot = nil
+			h.attentionCycleOrigin = ""
+			h.attentionCycleIndex = 0
+			h.attentionCycleLastSwitch = time.Time{}
+		}
+
+		// Attention switch: user pressed Ctrl+E while attached — jump to the
+		// highest-priority READY session (waiting/idle). Frozen snapshot so
+		// repeated presses cycle through the ready set; the origin session is
+		// excluded so the first hop never lands back where we just were.
+		if msg.attentionSwitchFrom != "" {
+			stale := !h.attentionCycleLastSwitch.IsZero() && time.Since(h.attentionCycleLastSwitch) > 3*time.Second
+			if h.attentionCycleSnapshot == nil || h.attentionCycleOrigin == "" || stale {
+				ready := h.attentionSortedSessions()
+				filtered := ready[:0]
+				for _, inst := range ready {
+					if inst.ID != msg.attentionSwitchFrom {
+						filtered = append(filtered, inst)
+					}
+				}
+				h.attentionCycleSnapshot = filtered
+				h.attentionCycleOrigin = msg.attentionSwitchFrom
+				h.attentionCycleIndex = -1
+			}
+			h.attentionCycleLastSwitch = time.Now()
+			if len(h.attentionCycleSnapshot) > 0 {
+				h.attentionCycleIndex = (h.attentionCycleIndex + 1) % len(h.attentionCycleSnapshot)
+				target := h.attentionCycleSnapshot[h.attentionCycleIndex]
+				if target.Exists() {
+					h.moveCursorToSession(target.ID)
+					return h, tea.Batch(tea.Sequence(tea.DisableMouse, tea.EnableMouseCellMotion), h.attachSession(target))
+				}
+			}
+			// Nothing ready to jump to — land on the list with a hint.
+			h.maintenanceMsg = "No sessions ready to pick up (Ctrl+E)"
+		}
+
+		// MRU switch: user pressed Ctrl+W while attached — attach to next MRU session.
+		// Uses a frozen snapshot so consecutive Ctrl+W presses cycle through the
+		// full list instead of bouncing between two sessions.
+		if msg.mruSwitchFrom != "" {
+			// Start a new chain, or reset if more than 3 seconds since last switch
+			stale := !h.mruCycleLastSwitch.IsZero() && time.Since(h.mruCycleLastSwitch) > 3*time.Second
+			if h.mruCycleSnapshot == nil || h.mruCycleOrigin == "" || stale {
+				h.mruCycleSnapshot = h.mruSortedSessions()
+				h.mruCycleOrigin = msg.mruSwitchFrom
+				h.mruCycleIndex = 0
+			}
+			h.mruCycleLastSwitch = time.Now()
+			if len(h.mruCycleSnapshot) >= 2 {
+				h.mruCycleIndex = (h.mruCycleIndex + 1) % len(h.mruCycleSnapshot)
+				// Skip the origin session (index 0)
+				if h.mruCycleIndex == 0 {
+					h.mruCycleIndex = 1
+				}
+				target := h.mruCycleSnapshot[h.mruCycleIndex]
+				if target.Exists() {
+					h.moveCursorToSession(target.ID)
+					return h, tea.Batch(tea.Sequence(tea.DisableMouse, tea.EnableMouseCellMotion), h.attachSession(target))
+				}
+			}
+		}
 
 		// PERFORMANCE FIX: Skip save on attach return for 10 seconds
 		// Saving can also be blocking (JSON serialization + file write).
@@ -5451,7 +5752,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// right edge), and schedule a delayed repaint for any pane-title/content
 		// cache changes that settle just after tmux restores the outer client.
 		return h, tea.Batch(
-			tea.EnableMouseCellMotion,
+			tea.Sequence(tea.DisableMouse, tea.EnableMouseCellMotion),
 			RestoreLegacyKeyboardCmd(os.Stdout),
 			tea.WindowSize(),
 			tea.Tick(attachReturnRefreshDelay, func(time.Time) tea.Msg { return attachReturnRefreshMsg{} }),
@@ -5772,6 +6073,29 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.setError(fmt.Errorf("Sent %d lines from '%s' to '%s'", msg.lineCount, msg.sourceTitle, msg.targetTitle))
 		}
 		return h, nil
+
+	case teardownResultMsg:
+		// The `gr` + `make down` cleanup finished; delete the session. A setup
+		// failure (no working dir) aborts; a cleanup failure only warns.
+		if msg.err != nil {
+			h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
+			return h, nil
+		}
+		// Re-resolve by ID: the pointer captured at key-press may have been
+		// replaced by a storage reload during the long-running teardown.
+		h.instancesMu.RLock()
+		inst := h.instanceByID[msg.id]
+		h.instancesMu.RUnlock()
+		if inst == nil {
+			h.setError(fmt.Errorf("teardown '%s': session no longer exists", msg.title))
+			return h, nil
+		}
+		if msg.warn != "" {
+			h.setError(fmt.Errorf("Teardown '%s' cleanup warning (%s) — deleting anyway", msg.title, msg.warn))
+		} else {
+			h.setError(fmt.Errorf("Teardown done for '%s' — deleting", msg.title))
+		}
+		return h, h.deleteSession(inst)
 
 	case watcherEventMsg:
 		// One-shot log per engine instance to confirm the listener path is alive.
@@ -6171,6 +6495,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.skillDialog.IsVisible() {
 			return h.handleSkillDialogKey(msg)
 		}
+		if h.ideaDialog.IsVisible() {
+			return h.handleIdeaDialogKey(msg)
+		}
 		if h.geminiModelDialog.IsVisible() {
 			d, cmd := h.geminiModelDialog.Update(msg)
 			h.geminiModelDialog = d
@@ -6200,6 +6527,14 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.zoxidePicker.IsVisible() {
 			return h.handleZoxidePickerKey(msg)
+		}
+
+		if h.maiaWorkerPicker.IsVisible() {
+			return h.handleMaiaWorkerPickerKey(msg)
+		}
+
+		if h.personalPicker.IsVisible() {
+			return h.handlePersonalPickerKey(msg)
 		}
 
 		if h.showCostDashboard {
@@ -6620,6 +6955,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			parentProjectPath,
 			tempID,
 			false, // not auto-named — user went through the full create dialog
+			false, // never lock auto/derived titles on the standard create path
 		)
 
 	case msg.String() == "esc":
@@ -6895,6 +7231,7 @@ func (h *Home) hasModalVisible() bool {
 		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
 		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
+		h.ideaDialog.IsVisible() ||
 		h.geminiModelDialog.IsVisible() || h.promptInputDialog.IsVisible() || h.sessionPickerDialog.IsVisible() ||
 		h.codeBlockDialog.IsVisible() ||
 		h.sessionSwitcher.IsVisible() ||
@@ -7076,6 +7413,22 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	uiLog.Info("keypress", "raw", raw, "normalized", key, "type", msg.Type, "runes", string(msg.Runes))
 	if key == "" {
 		return h, nil
+	}
+
+	// Reset MRU cycle position on any key except the cycle key itself
+	if key != "ctrl+w" {
+		h.mruCycleIndex = 0
+		h.mruCycleSnapshot = nil
+		h.mruCycleOrigin = ""
+		h.mruCycleLastSwitch = time.Time{}
+	}
+
+	// Reset attention cycle position on any key except its cycle key. (local fork)
+	if key != "ctrl+e" {
+		h.attentionCycleIndex = 0
+		h.attentionCycleSnapshot = nil
+		h.attentionCycleOrigin = ""
+		h.attentionCycleLastSwitch = time.Time{}
 	}
 
 	// v1.7.60: any keypress dismisses the one-shot nav-discoverability hint
@@ -7626,7 +7979,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "F", "shift+f":
+	case "z":
 		// Fork with dialog (customize title and group)
 		// Only available when the selected tool supports Agent Deck forking
 		if h.cursor < len(h.flatItems) {
@@ -7657,18 +8010,21 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "M", "shift+m":
-		// Move session to different group
+	case "o":
+		// Move session to different group. Pin the dialog to this session's
+		// ID so a background flatItems reshuffle while the dialog is open
+		// can't retarget the move to a different session under the cursor.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
-			if item.Type == session.ItemTypeSession {
-				h.groupDialog.ShowMove(h.scopedGroupPaths())
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				h.groupDialog.ShowMove(h.scopedGroupPaths(), item.Session.ID)
 			}
 		}
 		return h, nil
 
-	case "b":
-		// Re-run worktree setup script (bootstrap)
+	case "B":
+		// Re-run worktree setup script (bootstrap). Local fork: bound to "B"
+		// because upstream's default "b" is taken by exec_shell in this switch.
 		if h.cursor >= len(h.flatItems) {
 			return h, nil
 		}
@@ -7688,7 +8044,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.setupRunningSessions[inst.ID] = time.Now()
 		return h, h.runWorktreeSetup(inst)
 
-	case "W", "shift+w":
+	case "w":
 		// Worktree finish - merge + cleanup for worktree sessions
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -7820,14 +8176,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.settingsPanel.SetSize(h.width, h.height)
 		return h, nil
 
-	case "w":
-		// Open watcher panel
-		h.refreshWatcherPanel()
-		h.watcherPanel.Show()
-		h.watcherPanel.SetSize(h.width, h.height)
-		return h, nil
-
-	case "E":
+	case "b":
 		// Exec an interactive shell inside the sandbox container.
 		if selected := h.getSelectedSession(); selected != nil && selected.IsSandboxed() &&
 			selected.SandboxContainer != "" {
@@ -7846,14 +8195,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "n":
-		// Reset any stale remote target from a previously abandoned flow.
-		h.pendingRemoteName = ""
-		// If the cursor is on a remote group/session, open the same
-		// new-session dialog as for local items but remember the remote
-		// target (#1353). The submit handler routes the create to the remote
-		// via SSH with the chosen tool, so the #743 invariant still holds:
-		// the session is never created on localhost. (Previously this
-		// quick-created a shell on the remote with no tool selection.)
+		// Personal fork: 'n' opens the simple MAIA worker picker instead
+		// of the full NewDialog. The user always uses Claude in pre-created
+		// MAIA worktrees and wants a 2-key flow: 'n' → pick worktree → Enter.
+		// The full NewDialog is still in the tree but unreachable by 'n'.
+		// Remote sessions keep their dedicated branch (#743).
+		h.pendingRemoteName = "" // reset stale remote target from an abandoned flow
 		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
@@ -7861,105 +8208,32 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return h, nil
 			}
 		}
-
-		// Collect unique project paths sorted by most recently accessed
-		type pathInfo struct {
-			path           string
-			lastAccessedAt time.Time
-		}
-		pathMap := make(map[string]*pathInfo)
+		// Mark which worktrees/projects already host a session so the picker can
+		// park on the next open worker / tag busy rows. Occupied = any session,
+		// regardless of status, keyed by absolute project path.
+		occupied := make(map[string]bool)
+		h.instancesMu.RLock()
 		for _, inst := range h.instances {
-			if inst.ProjectPath == "" {
-				continue
-			}
-			// Prefer the original repo root over worktree paths so suggestions
-			// don't show ephemeral worktree directories.
-			p := inst.ProjectPath
-			if inst.WorktreeRepoRoot != "" {
-				p = inst.WorktreeRepoRoot
-			}
-			existing, ok := pathMap[p]
-			if !ok {
-				// First time seeing this path.
-				accessTime := inst.LastAccessedAt
-				if accessTime.IsZero() {
-					accessTime = inst.CreatedAt // Fall back to creation time.
-				}
-				pathMap[p] = &pathInfo{
-					path:           p,
-					lastAccessedAt: accessTime,
-				}
-			} else {
-				// Update if this instance was accessed more recently.
-				accessTime := inst.LastAccessedAt
-				if accessTime.IsZero() {
-					accessTime = inst.CreatedAt
-				}
-				if accessTime.After(existing.lastAccessedAt) {
-					existing.lastAccessedAt = accessTime
-				}
+			if inst != nil && inst.ProjectPath != "" {
+				occupied[session.ExpandPath(inst.ProjectPath)] = true
 			}
 		}
-
-		// Convert to slice and sort by most recent first
-		pathInfos := make([]*pathInfo, 0, len(pathMap))
-		for _, info := range pathMap {
-			pathInfos = append(pathInfos, info)
+		h.instancesMu.RUnlock()
+		// Personal profile gets its own picker (~/Projects + home + optiplex ssh)
+		// instead of the MAIA worker picker.
+		if h.profile == "personal" {
+			h.personalPicker.SetSize(h.width, h.height)
+			h.personalPicker.Show(occupied)
+			return h, nil
 		}
-		sort.Slice(pathInfos, func(i, j int) bool {
-			return pathInfos[i].lastAccessedAt.After(pathInfos[j].lastAccessedAt)
-		})
-
-		// Extract sorted paths
-		paths := make([]string, len(pathInfos))
-		for i, info := range pathInfos {
-			paths[i] = info.path
-		}
-		h.newDialog.SetPathSuggestions(paths)
-
-		// Load recent sessions for the picker
-		if recents, err := h.storage.LoadRecentSessions(); err == nil {
-			h.newDialog.SetRecentSessions(recents)
-		}
-
-		// Apply the preselected tool: explicit [default_tool] config wins,
-		// otherwise fall back to the last successfully-submitted tool remembered
-		// in the profile StateDB (UX top-3 #2). First run (neither set) leaves
-		// shell selected, unchanged.
-		h.newDialog.SetDefaultTool(resolveInitialTool(session.GetDefaultTool(), rememberedTool(h.stateDB())))
-
-		// Auto-select parent group from current cursor position
-		groupPath := session.DefaultGroupPath
-		groupName := session.DefaultGroupName
-		if h.groupScope != "" {
-			// Scoped mode: default to scope root
-			groupPath = h.groupScope
-			if group, exists := h.groupTree.Groups[h.groupScope]; exists {
-				groupName = group.Name
-			}
-		}
-		if h.cursor < len(h.flatItems) {
-			item := h.flatItems[h.cursor]
-			switch item.Type {
-			case session.ItemTypeGroup:
-				groupPath = item.Group.Path
-				groupName = item.Group.Name
-			case session.ItemTypeSession:
-				// Use the session's group
-				groupPath = item.Path
-				if group, exists := h.groupTree.Groups[groupPath]; exists {
-					groupName = group.Name
-				}
-			}
-		}
-		defaultPath := h.getDefaultPathForGroup(groupPath)
-		conductors := h.activeConductorSessions()
-		suggestedParentID := h.suggestConductorParent()
-		h.newDialog.ShowInGroup(groupPath, groupName, defaultPath, conductors, suggestedParentID)
+		h.maiaWorkerPicker.SetSize(h.width, h.height)
+		h.maiaWorkerPicker.Show(occupied)
 		return h, nil
 
-	case "N":
-		// Check if cursor is on a remote group/session — create on remote instead
+	case "a":
+		// Quick create (local fork keeps this on "a"; upstream's quick_approve
+		// is parked on ctrl+a). Check if cursor is on a remote group/session —
+		// create on remote instead.
 		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
@@ -7968,11 +8242,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// Quick create: auto-generated name, smart defaults from group context
 		return h, h.quickCreateSession()
-
-	case "z":
-		h.zoxidePicker.SetSize(h.width, h.height)
-		h.zoxidePicker.Show()
-		return h, nil
 
 	case "d":
 		// Show confirmation dialog before deletion (prevents accidental deletion)
@@ -8001,7 +8270,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "D":
+	case "ctrl+x":
 		// Close session process without deleting metadata from the list/storage.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -8050,25 +8319,18 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "ctrl+x":
-		// Bulk remove all errored sessions from the registry.
-		count := 0
-		h.instancesMu.RLock()
-		for _, inst := range h.instances {
-			if inst.Status == session.StatusError {
-				count++
-			}
-		}
-		h.instancesMu.RUnlock()
-		if count == 0 {
-			h.setError(fmt.Errorf("no errored sessions to remove"))
-			return h, nil
-		}
-		h.confirmDialog.ShowBulkRemoveErrored(count)
-		return h, nil
-
 	case "i":
 		return h, h.importSessions
+
+	case "alt+i":
+		// Capture a "by the way" idea from the dashboard — the in-view twin of
+		// the Ctrl+Alt+I popup bound inside sessions. (Bubble Tea v1 can't
+		// deliver ctrl+alt+i as a distinct key, so the dashboard uses Alt+I.)
+		// Dashboard capture is contextless: it records just the idea text, not
+		// whichever session the cursor happens to be on. (local fork)
+		h.ideaDialog.SetSize(h.width, h.height)
+		h.ideaDialog.Show()
+		return h, nil
 
 	case "I":
 		// Enter insert mode (#1069 feature 1): subsequent keystrokes are
@@ -8164,9 +8426,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.previewMode = (h.previewMode + 1) % 3
 		return h, nil
 
-	case "t":
+	case "V":
 		// Cycle list partition: normal → active-on-top → populated-on-top → normal.
-		// Preserve the cursor's row identity across the rebuild.
+		// Local fork: bound to "V" (View) because upstream's default "t" is taken
+		// by restart in this switch. Preserve the cursor's row identity across the rebuild.
 		selectedBefore := h.captureSelectedItemIdentity()
 		h.groupViewMode = session.GroupViewMode((int(h.groupViewMode) + 1) % session.GroupViewModeCount)
 		h.rebuildFlatItemsPreservingSelection(selectedBefore)
@@ -8176,80 +8439,18 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, h.fetchSelectedPreview()
 
 	case "y":
-		// Toggle YOLO mode for Gemini or Codex sessions (requires restart)
+		// Teardown: run `gr` (reset worktree) + `make down` (stop docker) directly
+		// in the worktree, tool-agnostically, then delete the session.
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
-				inst := item.Session
-				toggled := false
-
-				switch inst.Tool {
-				case "gemini":
-					currentYolo := false
-					if inst.GeminiYoloMode != nil {
-						currentYolo = *inst.GeminiYoloMode
-					} else {
-						userConfig, _ := session.LoadUserConfig()
-						if userConfig != nil {
-							currentYolo = userConfig.Gemini.YoloMode
-						}
-					}
-					newYolo := !currentYolo
-					inst.GeminiYoloMode = &newYolo
-					toggled = true
-
-				case "codex":
-					currentYolo := false
-					opts := inst.GetCodexOptions()
-					if opts != nil && opts.YoloMode != nil {
-						currentYolo = *opts.YoloMode
-					} else {
-						userConfig, _ := session.LoadUserConfig()
-						if userConfig != nil {
-							currentYolo = userConfig.Codex.YoloMode
-						}
-					}
-					newYolo := !currentYolo
-					if opts == nil {
-						opts = &session.CodexOptions{}
-					}
-					opts.YoloMode = &newYolo
-					_ = inst.SetCodexOptions(opts)
-					toggled = true
-
-				case "hermes":
-					currentYolo := false
-					opts := inst.GetHermesOptions()
-					if opts != nil && opts.YoloMode != nil {
-						currentYolo = *opts.YoloMode
-					} else {
-						userConfig, _ := session.LoadUserConfig()
-						if userConfig != nil {
-							currentYolo = userConfig.Hermes.YoloMode
-						}
-					}
-					newYolo := !currentYolo
-					if opts == nil {
-						opts = &session.HermesOptions{}
-					}
-					opts.YoloMode = &newYolo
-					_ = inst.SetHermesOptions(opts)
-					toggled = true
-				}
-
-				if toggled {
-					h.saveInstances()
-					if inst.GetStatusThreadSafe() == session.StatusRunning ||
-						inst.GetStatusThreadSafe() == session.StatusWaiting {
-						h.resumingSessions[inst.ID] = time.Now()
-						return h, h.restartSession(inst)
-					}
-				}
+				h.setError(fmt.Errorf("Tearing down '%s' (gr + make down)…", item.Session.Title))
+				return h, h.teardownSession(item.Session)
 			}
 		}
 		return h, nil
 
-	case "R":
+	case "t":
 		// Restart session (recreate tmux session with resume)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -8266,6 +8467,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
 				return h, h.restartRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
+			}
+		}
+		return h, nil
+
+	case "ctrl+t":
+		// Hard restart session (fresh claude session, no --resume)
+		if h.cursor < len(h.flatItems) {
+			item := h.flatItems[h.cursor]
+			if item.Type == session.ItemTypeSession && item.Session != nil {
+				if h.hasActiveAnimation(item.Session.ID) {
+					h.setError(fmt.Errorf("session is starting, please wait..."))
+					return h, nil
+				}
+				if session.IsClaudeCompatible(item.Session.Tool) {
+					h.resumingSessions[item.Session.ID] = time.Now()
+					return h, h.hardRestartSession(item.Session)
+				}
 			}
 		}
 		return h, nil
@@ -8395,20 +8613,17 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		return h, cmd
 
-	case "ctrl+s":
-		// Open the session switcher from the overview too, with the same key
-		// used while attached. Pre-highlight the session under the cursor (if
-		// any) so it lines up with what the user is already looking at; Esc just
-		// closes (we're not attached, so there is nothing to re-attach to).
-		fromID := ""
-		if sel := h.getSelectedSession(); sel != nil {
-			fromID = sel.ID
-		}
-		h.openSessionSwitcher(fromID, false)
-		return h, nil
+	// NOTE: upstream's overview Ctrl+S session-switcher handler is intentionally
+	// omitted (local fork). Ctrl+S is XOFF and is what some terminals/tmux send
+	// for Cmd+Right, so it kept opening the switcher unexpectedly. switch_session
+	// is unbound in defaultHotkeyBindings; the switcher code is kept (still
+	// reachable in principle via openSessionSwitcher) to avoid re-conflicting
+	// with upstream every sync. Re-add this case if you ever rebind it.
 
-	case "ctrl+e":
-		// Open feedback dialog on demand (per D-11: bypasses ShouldShow -- user-initiated)
+	case "F":
+		// Open feedback dialog on demand (per D-11: bypasses ShouldShow -- user-initiated).
+		// Local fork: moved off Ctrl+E (now the priority attention switcher) to
+		// Shift+F. The feedback feature itself is unchanged; only the key differs.
 		if h.feedbackDialog != nil {
 			st := h.feedbackState
 			if st == nil {
@@ -8484,13 +8699,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "$", "shift+4":
-		// Cost dashboard (when cost tracking is active), otherwise filter to error sessions
-		if h.costStore != nil {
-			h.showCostDashboard = true
-			h.costDashboard = newCostDashboard(h.costStore, h.width, h.height)
-			return h, nil
-		}
-		// Fallback: filter to error sessions only
+		// Filter to error sessions only
 		if h.statusFilter == session.StatusError {
 			h.statusFilter = "" // Toggle off
 		} else {
@@ -8507,6 +8716,53 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.statusFilter = FilterModeActive
 		}
 		h.rebuildFlatItems()
+
+	case "ctrl+w":
+		// Open the MRU-ordered session switcher (upstream feature, remapped to
+		// Ctrl+W in the local fork — replaces the old blind MRU cursor-cycle).
+		// Pre-highlight the session under the cursor; tap Ctrl+W again to advance.
+		fromID := ""
+		if sel := h.getSelectedSession(); sel != nil {
+			fromID = sel.ID
+		}
+		h.openSessionSwitcher(fromID, false)
+		return h, nil
+
+	case "ctrl+e":
+		// Attention cycle (local fork): move the cursor through READY sessions
+		// (waiting/idle, never running) ordered by priority, then longest-waiting.
+		//
+		// The ready set is recomputed on EVERY press rather than frozen on the
+		// first, so the cycle always reflects reality: a session that just went
+		// busy drops out and a higher-priority one that just became ready drops
+		// in immediately. (The old frozen snapshot meant Ctrl+E could keep
+		// landing on a stale session and never reach the now-most-important one.)
+		//
+		// Cycle position is tracked by the cursor's current session: the first
+		// press of a burst lands on the top-priority ready session, and each
+		// repeat advances to the next one and wraps. Any other key zeroes
+		// attentionCycleLastSwitch (above), so a fresh burst — or one resumed
+		// after a >3s lull — restarts from the top.
+		ready := h.attentionSortedSessions()
+		if len(ready) == 0 {
+			h.maintenanceMsg = "No sessions ready to pick up (Ctrl+E)"
+			return h, nil
+		}
+		firstPress := h.attentionCycleLastSwitch.IsZero()
+		stale := !firstPress && time.Since(h.attentionCycleLastSwitch) > 3*time.Second
+		next := 0
+		if !firstPress && !stale {
+			if cur := h.getSelectedSession(); cur != nil {
+				for i, s := range ready {
+					if s.ID == cur.ID {
+						next = (i + 1) % len(ready)
+						break
+					}
+				}
+			}
+		}
+		h.attentionCycleLastSwitch = time.Now()
+		h.moveCursorToSession(ready[next].ID)
 		return h, nil
 
 	case FilterKeyArchived, "shift+6":
@@ -8663,9 +8919,6 @@ func (h *Home) confirmAction() tea.Cmd {
 			h.confirmDialog.Hide()
 			return h.removeSession(inst)
 		}
-	case ConfirmBulkRemoveErrored:
-		h.confirmDialog.Hide()
-		return h.bulkRemoveErrored()
 	}
 	h.confirmDialog.Hide()
 	return nil
@@ -8699,6 +8952,7 @@ func (h *Home) confirmCreateDirectory() tea.Cmd {
 		parentProjectPath,
 		"",    // no placeholder — non-worktree sessions are fast
 		false, // not auto-named
+		false, // never lock title on this path
 	)
 }
 
@@ -9561,11 +9815,15 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.saveInstances()
 			}
 		case GroupDialogMove:
+			// Resolve the session by ID captured at dialog open, not by the
+			// current cursor position: flatItems can reshuffle while the
+			// dialog is open (status ticks, group reorders), and reading
+			// h.flatItems[h.cursor] here would target the wrong session.
 			targetGroupPath := h.groupDialog.GetSelectedGroup()
-			if targetGroupPath != "" && h.cursor < len(h.flatItems) {
-				item := h.flatItems[h.cursor]
-				if item.Type == session.ItemTypeSession {
-					h.groupTree.MoveSessionToGroup(item.Session, targetGroupPath)
+			sessionID := h.groupDialog.GetSessionID()
+			if targetGroupPath != "" && sessionID != "" {
+				if inst := h.getInstanceByID(sessionID); inst != nil {
+					h.groupTree.MoveSessionToGroup(inst, targetGroupPath)
 					h.instancesMu.Lock()
 					h.instances = h.groupTree.GetAllInstances()
 					h.instancesMu.Unlock()
@@ -9646,6 +9904,44 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	h.groupDialog, cmd = h.groupDialog.Update(msg)
 	return h, cmd
+}
+
+// handleIdeaDialogKey handles input for the dashboard idea-capture dialog:
+// Enter saves the idea (with the snapshotted session context) to the global
+// backlog, Esc cancels, everything else types into the field. (local fork)
+func (h *Home) handleIdeaDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		if text := h.ideaDialog.Value(); text != "" {
+			h.appendDashboardIdea(text)
+		}
+		h.ideaDialog.Hide()
+		return h, nil
+	case "esc":
+		h.ideaDialog.Hide()
+		return h, nil
+	}
+	var cmd tea.Cmd
+	h.ideaDialog, cmd = h.ideaDialog.Update(msg)
+	return h, cmd
+}
+
+// buildIdeaEntry builds a contextless idea entry — just the text and capture
+// time. Dashboard capture deliberately omits session context (unlike the
+// in-session Ctrl+Alt+I popup, which snapshots its own session). (local fork)
+func (h *Home) buildIdeaEntry(text string, now time.Time) ideas.IdeaEntry {
+	return ideas.IdeaEntry{Text: text, At: now}
+}
+
+// appendDashboardIdea appends the captured idea to the global backlog
+// (~/.agent-deck/ideas.md), mirroring the CLI `agent-deck idea` capture.
+// (local fork)
+func (h *Home) appendDashboardIdea(text string) {
+	if err := appendIdeaFunc(h.buildIdeaEntry(text, time.Now())); err != nil {
+		h.setError(fmt.Errorf("idea capture failed: %w", err))
+		return
+	}
+	h.maintenanceMsg = "💡 Idea captured to ideas.md"
 }
 
 // handleForkDialogKey handles keyboard input for the fork dialog
@@ -9964,6 +10260,7 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	parentSessionID, parentProjectPath string,
 	tempID string,
 	autoName bool,
+	titleLocked bool,
 ) tea.Cmd {
 	return func() tea.Msg {
 		uiLog.Info("create_session_start",
@@ -10013,6 +10310,11 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		}
 		inst.Command = command
 		inst.SetAutoName(autoName) // quick-create paths pass true; see render substitution
+		// titleLocked pins an auto-generated/untitled name so Claude's
+		// session-name sync can't overwrite it (#697). MAIA workers use this so
+		// the row keeps showing the live pane title / worktree rather than
+		// Claude's conversation summary.
+		inst.TitleLocked = titleLocked
 
 		// Set worktree fields if provided
 		if worktreePath != "" {
@@ -10475,8 +10777,9 @@ func (h *Home) quickCreateSession() tea.Cmd {
 		"",         // no explicit model override
 		false, nil, // no multi-repo
 		"", "", // no parent
-		"",   // no placeholder
-		true, // quick-create → auto-named handle
+		"",    // no placeholder
+		true,  // quick-create → auto-named handle
+		false, // never lock title on the recent-session path
 	)
 }
 
@@ -10529,18 +10832,212 @@ func (h *Home) handleZoxidePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// handleMaiaWorkerPickerKey routes keys for the simple new-session picker
+// that replaces the 'n' dialog. Enter creates the session, Esc cancels;
+// everything else (incl. arrow keys) goes through the picker's Update so
+// the cursor moves and the textinput accepts typing.
+func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		h.maiaWorkerPicker.Hide()
+		return h, nil
+	case "c", "tab":
+		// Toggle the active tool (Claude ⟷ Codex). The action keys below
+		// (Enter, r, ~) then create with whichever tool is active, so 'c'
+		// chains into any action instead of immediately creating.
+		h.maiaWorkerPicker.ToggleTool()
+		return h, nil
+	case "enter":
+		// Create with the active tool in the highlighted worker.
+		tool := h.maiaWorkerPicker.ActiveTool()
+		selected, group := h.maiaWorkerPicker.Selected()
+		h.maiaWorkerPicker.Hide()
+		if selected == "" {
+			return h, nil
+		}
+		return h, h.createMaiaWorkerSession(selected, group, tool)
+	case "s":
+		// Raw shell: spawn a plain shell (empty command) in the highlighted
+		// worktree, independent of the active tool. Mirrors the empty-command
+		// escape hatch the full NewDialog offered before this picker replaced it.
+		selected, group := h.maiaWorkerPicker.Selected()
+		h.maiaWorkerPicker.Hide()
+		if selected == "" {
+			return h, nil
+		}
+		return h, h.createMaiaWorkerSession(selected, group, "")
+	case "r":
+		// Read-only dev: create a session in the shared MAIA.ro-dev worktree
+		// directly with the active tool, bypassing the worker column.
+		tool := h.maiaWorkerPicker.ActiveTool()
+		selected, group := h.maiaWorkerPicker.RoDevSelected()
+		h.maiaWorkerPicker.Hide()
+		if selected == "" {
+			return h, nil
+		}
+		return h, h.createMaiaWorkerSession(selected, group, tool)
+	case "~":
+		// Spawn the active tool rooted at the home dir — a quick scratch
+		// session outside the MAIA worktrees. Group is derived from the path.
+		tool := h.maiaWorkerPicker.ActiveTool()
+		h.maiaWorkerPicker.Hide()
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return h, nil
+		}
+		return h, h.quickCreateSessionAtWithTool(home, tool)
+	default:
+		h.maiaWorkerPicker, _ = h.maiaWorkerPicker.Update(msg)
+		return h, nil
+	}
+}
+
+// createMaiaWorkerSession creates a session rooted at the given MAIA worktree
+// path in the given group, running the given command. An empty command yields
+// a plain shell session; "codex" always launches in YOLO mode (the MAIA flow
+// trusts these worktrees, so codex skips approvals + sandbox).
+//
+// Naming: both workers and ro-dev get an auto-generated adjective-noun name so
+// the label engine treats them as untitled and shows the dynamic chain
+// (branch → Claude pane title → worktree folder) instead of a sticky title. A
+// path-derived name like "MAIA.worker-3" would otherwise win as a "user-chosen"
+// title and pin itself, hiding the live activity. Workers additionally lock the
+// title so Claude's conversation-name sync can't replace the auto name and pin
+// the conversation summary as the primary label — the user wants live activity,
+// not the summary. ro-dev stays unlocked (it's name-first via
+// nameFirstWorktreePrefixes and already routes to the broadcast).
+func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.Cmd {
+	if group == "" {
+		group = maiaWorkerGroup
+	}
+
+	// Codex always runs YOLO in the MAIA flow.
+	var toolOptionsJSON json.RawMessage
+	if command == "codex" {
+		yolo := true
+		toolOptionsJSON, _ = session.MarshalToolOptions(&session.CodexOptions{YoloMode: &yolo})
+	}
+
+	h.instancesMu.RLock()
+	name := session.GenerateUniqueSessionName(h.instances, group)
+	h.instancesMu.RUnlock()
+
+	lockTitle := group != maiaRoDevGroup
+
+	return h.createSessionInGroupWithWorktreeAndOptions(
+		name, projectPath, command,
+		group,
+		"", "", "", // no worktree (path is already a pre-created worktree)
+		false, false, toolOptionsJSON,
+		nil, // no extra claude args
+		"",  // no claude startup query
+		"",  // no explicit model override
+		false, nil,
+		"", "",
+		"",
+		false,     // not auto-named
+		lockTitle, // MAIA workers (non ro-dev group) lock the title
+	)
+}
+
+// handlePersonalPickerKey routes keys for the personal new-session picker.
+// Enter creates a session at the highlighted target with the active tool, Tab
+// cycles the tool, Esc cancels; everything else (navigation + filter typing)
+// goes through the picker's Update.
+func (h *Home) handlePersonalPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		h.personalPicker.Hide()
+		return h, nil
+	case "tab":
+		h.personalPicker.ToggleTool()
+		return h, nil
+	case "enter":
+		target, ok := h.personalPicker.Selected()
+		tool := h.personalPicker.ActiveTool()
+		h.personalPicker.Hide()
+		if !ok {
+			return h, nil
+		}
+		switch target.kind {
+		case personalKindSSH:
+			return h, h.createSSHSession(optiplexLabel, target.command)
+		case personalKindHome:
+			home, err := os.UserHomeDir()
+			if err != nil || home == "" {
+				return h, nil
+			}
+			return h, h.quickCreateSessionAtWithTool(home, tool)
+		default: // personalKindProject
+			if target.path == "" {
+				return h, nil
+			}
+			return h, h.quickCreateSessionAtWithTool(target.path, tool)
+		}
+	default:
+		h.personalPicker, _ = h.personalPicker.Update(msg)
+		return h, nil
+	}
+}
+
+// createSSHSession creates a plain shell session rooted at the home dir that
+// runs the given command (e.g. an ssh login). createSessionTool maps the
+// unknown command to the "shell" tool and runs it verbatim in the pane.
+func (h *Home) createSSHSession(label, command string) tea.Cmd {
+	if command == "" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	h.instancesMu.RLock()
+	name := ensureUniqueSessionTitle(label, h.instances)
+	h.instancesMu.RUnlock()
+
+	return h.createSessionInGroupWithWorktreeAndOptions(
+		name, home, command,
+		"",         // empty group → derived from path
+		"", "", "", // no worktree
+		false, false, nil,
+		nil, // no extra claude args
+		"",  // no claude startup query
+		"",  // no explicit model override
+		false, nil,
+		"", "",
+		"",
+		false, // not auto-named
+		false, // never lock title
+	)
+}
+
 // quickCreateSessionAt creates a session rooted at the given path with an
 // auto-generated name and the user's configured default tool, bypassing
 // cursor-context tool inheritance so the zoxide flow always lands on the
 // user's chosen default (Claude, unless overridden in config.toml).
 func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
-	tool := session.GetDefaultTool()
+	return h.quickCreateSessionAtWithTool(projectPath, "")
+}
+
+// quickCreateSessionAtWithTool is quickCreateSessionAt with an explicit tool
+// override (e.g. the MAIA picker's tool switcher). An empty tool falls back to
+// the configured default. Codex always launches YOLO, matching the worker flow.
+func (h *Home) quickCreateSessionAtWithTool(projectPath, tool string) tea.Cmd {
+	if tool == "" {
+		tool = session.GetDefaultTool()
+	}
 	if tool == "" {
 		tool = "claude"
 	}
 	command := tool
 	if tool == "shell" {
 		command = ""
+	}
+
+	var toolOptionsJSON json.RawMessage
+	if tool == "codex" {
+		yolo := true
+		toolOptionsJSON, _ = session.MarshalToolOptions(&session.CodexOptions{YoloMode: &yolo})
 	}
 
 	preferred := deriveSessionNameFromPath(projectPath)
@@ -10552,14 +11049,15 @@ func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
 		name, projectPath, command,
 		"",         // empty group → creator derives from path via extractGroupPath
 		"", "", "", // no worktree
-		false, false, nil,
+		false, false, toolOptionsJSON,
 		nil, // no extra claude args
 		"",  // no claude startup query
 		"",  // no explicit model override
 		false, nil,
 		"", "",
 		"",
-		true, // quick-create → auto-named handle
+		true,  // quick-create → auto-named handle
+		false, // never lock title on the quick-create path
 	)
 }
 
@@ -11372,27 +11870,6 @@ func (h *Home) removeSession(inst *session.Instance) tea.Cmd {
 	}
 }
 
-// bulkRemoveErrored removes every session currently in the 'error' state.
-// Emits one sessionDeletedMsg per removed session; Update is idempotent
-// on repeated deletedIDs.
-func (h *Home) bulkRemoveErrored() tea.Cmd {
-	h.instancesMu.RLock()
-	ids := make([]string, 0, len(h.instances))
-	for _, inst := range h.instances {
-		if inst.Status == session.StatusError {
-			ids = append(ids, inst.ID)
-		}
-	}
-	h.instancesMu.RUnlock()
-
-	cmds := make([]tea.Cmd, 0, len(ids))
-	for _, id := range ids {
-		id := id
-		cmds = append(cmds, func() tea.Msg { return sessionDeletedMsg{deletedID: id} })
-	}
-	return tea.Batch(cmds...)
-}
-
 // sessionRestartedMsg signals that a session was restarted.
 type sessionRestartedMsg struct {
 	sessionID string
@@ -11584,6 +12061,36 @@ func (h *Home) restartRemoteSession(remoteName, sessionID, title string) tea.Cmd
 	}
 }
 
+// hardRestartSession starts a completely fresh Claude session (no --resume).
+func (h *Home) hardRestartSession(inst *session.Instance) tea.Cmd {
+	id := inst.ID
+	mcpUILog.Debug(
+		"hard_restart_session_called",
+		slog.String("id", inst.ID),
+		slog.String("title", inst.Title),
+		slog.String("tool", inst.Tool),
+	)
+	return func() tea.Msg {
+		mcpUILog.Debug("hard_restart_session_executing", slog.String("id", id))
+
+		h.instancesMu.RLock()
+		current := h.instanceByID[id]
+		h.instancesMu.RUnlock()
+		if current == nil {
+			err := fmt.Errorf("session no longer exists")
+			mcpUILog.Debug("hard_restart_session_result", slog.String("id", id), slog.Any("error", err))
+			return sessionRestartedMsg{sessionID: id, err: err}
+		}
+
+		err := current.HardRestart()
+		mcpUILog.Debug("hard_restart_session_result", slog.String("id", id), slog.Any("error", err))
+		return sessionRestartedMsg{
+			sessionID: id,
+			err:       err,
+		}
+	}
+}
+
 // attachSession attaches to a session using custom PTY with Ctrl+Q detection
 func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 	tmuxSess := inst.GetTmuxSession()
@@ -11666,8 +12173,7 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 		// Capture current pane CWD after attach returns for optional path follow.
 		currentWorkDir := strings.TrimSpace(tmuxSess.GetWorkDir())
 
-		// The user pressed the session-switch key while attached: surface the
-		// in-attach switcher instead of just returning to the list.
+		// Upstream Ctrl+S session-switch: surface the in-attach switcher.
 		if res.intent != tmux.SwitchNone {
 			// While attached the user may have switched the tmux client to
 			// another session via the notification bar (Ctrl+b 1-6), recorded
@@ -11702,7 +12208,19 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 			}
 		}
 
-		return statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: currentWorkDir}
+		msg := statusUpdateMsg{attachedSessionID: inst.ID, attachedWorkDir: currentWorkDir}
+
+		// Local fork: Ctrl+W (MRU switch) → immediately attach to the previous
+		// session; Ctrl+E (attention switch) → attach to the highest-priority
+		// ready session. Both arrive as a sentinel error from AttachWithOptions.
+		if errors.Is(err, tmux.ErrMRUSwitch) {
+			msg.mruSwitchFrom = inst.ID
+		}
+		if errors.Is(err, tmux.ErrAttentionSwitch) {
+			msg.attentionSwitchFrom = inst.ID
+		}
+
+		return msg
 	})
 }
 
@@ -11778,6 +12296,9 @@ func (a attachCmd) Run() error {
 	// Removing clear screen here prevents double-clearing which corrupts terminal state
 
 	ctx := context.Background()
+	// AttachWithOptions returns the session-switch intent (Ctrl+S) plus an err
+	// that, for the local-fork MRU/attention switch keys, is ErrMRUSwitch /
+	// ErrAttentionSwitch. Both mechanisms are surfaced to the callback.
 	intent, err := a.session.AttachWithOptions(ctx, a.opts)
 	if a.result != nil {
 		a.result.intent = intent
@@ -12283,6 +12804,9 @@ func (h *Home) View() string {
 	if h.skillDialog.IsVisible() {
 		return h.skillDialog.View()
 	}
+	if h.ideaDialog.IsVisible() {
+		return h.ideaDialog.View()
+	}
 	if h.geminiModelDialog.IsVisible() {
 		return h.geminiModelDialog.View()
 	}
@@ -12303,6 +12827,12 @@ func (h *Home) View() string {
 	}
 	if h.zoxidePicker.IsVisible() {
 		return h.zoxidePicker.View()
+	}
+	if h.maiaWorkerPicker.IsVisible() {
+		return h.maiaWorkerPicker.View()
+	}
+	if h.personalPicker.IsVisible() {
+		return h.personalPicker.View()
 	}
 	if h.showCostDashboard {
 		return h.costDashboard.View()
@@ -14229,6 +14759,7 @@ func (h *Home) renderSessionList(width, height int) string {
 
 	snapshot := h.getSessionRenderSnapshot()
 	groupStats := h.buildGroupRenderStats(snapshot)
+	h.computeSessionLabels(snapshot)
 	var jumpHintByItemIndex map[int]string
 	if h.jumpMode {
 		selectable := selectableItemIndices(h.flatItems)
@@ -14337,6 +14868,48 @@ func (h *Home) buildGroupRenderStats(snapshot map[string]sessionRenderState) map
 	}
 
 	return stats
+}
+
+// maxPrimaryColCells caps the primary-label column so one long label (a
+// verbose Claude broadcast, say) can't shove the worktree chip off the
+// right edge. Branches/folders/names sit well under this; anything longer
+// truncates into the column rather than blowing out the table.
+const maxPrimaryColCells = 28
+
+// computeSessionLabels runs the dynamic-precedence identity pass once per
+// render: pass one tallies how many visible sessions share each branch (so
+// a branch shared across ro-dev sessions is recognized as non-
+// distinguishing), pass two picks each session's primary label and
+// measures the column. Derived from ALL session items in flatItems (not
+// just the visible window) so the column doesn't jump as the user scrolls.
+func (h *Home) computeSessionLabels(snapshot map[string]sessionRenderState) {
+	branchCount := map[string]int{}
+	for _, item := range h.flatItems {
+		if item.Type != session.ItemTypeSession || item.Session == nil || item.CreatingID != "" {
+			continue
+		}
+		if st, ok := snapshot[item.Session.ID]; ok && st.branch != "" {
+			branchCount[st.branch]++
+		}
+	}
+
+	labels := make(map[string]primaryLabel)
+	colW := 0
+	for _, item := range h.flatItems {
+		if item.Type != session.ItemTypeSession || item.Session == nil || item.CreatingID != "" {
+			continue
+		}
+		lbl := primaryLabelFor(item.Session, snapshot[item.Session.ID], branchCount)
+		labels[item.Session.ID] = lbl
+		if w := cellWidth(lbl.text); w > colW {
+			colW = w
+		}
+	}
+	if colW > maxPrimaryColCells {
+		colW = maxPrimaryColCells
+	}
+	h.primaryLabels = labels
+	h.primaryColCells = colW
 }
 
 // renderItem renders a single item (group or session) for the left panel
@@ -14562,6 +15135,32 @@ func (h *Home) renderCreatingSessionItem(
 	b.WriteString("\n")
 }
 
+// priorityBadge renders the conductor-assigned attention priority as a filled,
+// color-tiered chip — P1 red, P2 orange, P3 yellow — so the dashboard surfaces
+// at a glance which ready threads the Ctrl+E switcher will jump to first.
+// Returns "" for unset (0) so unprioritized rows stay clean. On the selected
+// row it reuses the selection-bar style so the chip stays legible inside the
+// highlight. (local fork)
+func priorityBadge(prio int, selected bool) string {
+	if prio <= 0 {
+		return ""
+	}
+	if selected {
+		return SessionStatusSelStyle.Render(fmt.Sprintf(" P%d", prio))
+	}
+	var bg lipgloss.Color
+	switch prio {
+	case 1:
+		bg = ColorRed
+	case 2:
+		bg = ColorOrange
+	default:
+		bg = ColorYellow
+	}
+	chip := lipgloss.NewStyle().Foreground(ColorBg).Background(bg).Bold(true)
+	return " " + chip.Render(fmt.Sprintf(" P%d ", prio))
+}
+
 // renderSessionItem renders a single session row into b, including the tree
 // connector, status badge, tool label, and the dim tmux pane-title suffix.
 // The pane-title suffix appears on the selected row, or on every row when
@@ -14719,20 +15318,46 @@ func (h *Home) renderSessionItem(
 		}
 	}
 
-	tool := toolStyle.Render(" " + instTool)
-
-	// Supervisor badge for the maestro row.
-	maestroBadge := ""
-	if isMaestro {
-		mStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
-		if selected {
-			mStyle = SessionStatusSelStyle
-		}
-		maestroBadge = mStyle.Render(" [SUPERVISOR]")
+	// Primary label: the single identity anchor for the row, chosen by
+	// dynamic precedence in computeSessionLabels (custom name > distinguishing
+	// branch > folder/worktree > Claude broadcast > auto name). Styled by the
+	// winning kind — branch is purple, a folder takes its own worktree color,
+	// broadcast/auto fade to dim, a real name uses the status title style.
+	// Padded to the measured column so the worktree chip lines up table-style.
+	lbl := h.primaryLabels[inst.ID]
+	if lbl.kind == primaryNone {
+		lbl = primaryLabelFor(inst, instState, nil)
 	}
+	primaryText := lbl.text
+	// pin-sessions (upstream): flag pinned rows with a 📌 prefix. Position in
+	// the list conveys top vs bottom; the emoji conveys "this is pinned".
+	if inst.Pin != session.PinNone {
+		primaryText = "📌 " + primaryText
+	}
+	// Maestro / fleet supervisor (upstream): ⬢ glyph leads the identity label
+	// (the local fork also appends a [SUPERVISOR] badge further along the row).
+	if isMaestro {
+		primaryText = "⬢ " + primaryText
+	}
+	if h.primaryColCells > 0 && cellWidth(primaryText) > h.primaryColCells {
+		primaryText = cellTruncate(primaryText, h.primaryColCells, "…")
+	}
+	var primaryStyle lipgloss.Style
+	switch {
+	case selected:
+		primaryStyle = SessionTitleSelStyle
+	case lbl.kind == primaryBranch:
+		primaryStyle = lipgloss.NewStyle().Foreground(ColorPurple).Bold(true)
+	case lbl.kind == primaryFolder:
+		primaryStyle = lipgloss.NewStyle().Foreground(worktreeColor(lbl.text)).Bold(true)
+	case lbl.kind == primaryBroadcast, lbl.kind == primaryAuto:
+		primaryStyle = lipgloss.NewStyle().Foreground(ColorTextDim)
+	default: // primaryName — reuse the status-based title styling + per-session tint
+		primaryStyle = titleStyle
+	}
+	primary := " " + padToCells(primaryStyle.Render(primaryText), cellWidth(primaryText), h.primaryColCells)
 
-	// YOLO badge for Gemini/Codex sessions with YOLO mode enabled
-	yoloBadge := ""
+	// YOLO (auto-approve / dangerous) mode for gemini/codex/hermes sessions.
 	showYolo := false
 	if instTool == "gemini" && inst.GeminiYoloMode != nil && *inst.GeminiYoloMode {
 		showYolo = true
@@ -14751,26 +15376,53 @@ func (h *Home) renderSessionItem(
 			showYolo = true
 		}
 	}
-	if showYolo {
-		yoloStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
-		if selected {
-			yoloStyle = SessionStatusSelStyle
+
+	// Personal fork: hide the tool word when it's "claude" — the user's
+	// default, repeated on nearly every row. Other tools (shell, gemini,
+	// codex, custom commands) still surface so the row isn't ambiguous.
+	//
+	// YOLO mode folds INTO the tool word rather than a separate badge: the word
+	// is recolored to a danger style (yellow bold) with a trailing "!", e.g.
+	// "codex!". gemini/codex/hermes always show their tool word (they're never
+	// "claude"), so this adds at most one cell — keeping worker-N rows aligned
+	// instead of the old 7-cell " [YOLO]" badge that ragged every trailing
+	// column whenever some workers had YOLO and others didn't.
+	tool := ""
+	if instTool != "claude" {
+		if showYolo {
+			yoloStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
+			if selected {
+				yoloStyle = SessionStatusSelStyle
+			}
+			tool = yoloStyle.Render(" " + instTool + "!")
+		} else {
+			tool = toolStyle.Render(" " + instTool)
 		}
-		yoloBadge = yoloStyle.Render(" [YOLO]")
 	}
 
-	// Worktree branch badge for sessions running in git worktrees.
-	worktreeBadge := ""
-	if inst.IsWorktree() && inst.WorktreeBranch != "" {
-		branch := inst.WorktreeBranch
-		if len(branch) > 15 {
-			branch = branch[:12] + "..."
-		}
-		wtStyle := lipgloss.NewStyle().Foreground(ColorCyan)
+	// Supervisor badge for the maestro row.
+	maestroBadge := ""
+	if isMaestro {
+		mStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
 		if selected {
-			wtStyle = SessionStatusSelStyle
+			mStyle = SessionStatusSelStyle
 		}
-		worktreeBadge = wtStyle.Render(" [" + branch + "]")
+		maestroBadge = mStyle.Render(" [SUPERVISOR]")
+	}
+
+	// Worktree badge: shown for every session whose project path or
+	// worktree branch identifies a worktree. Color-coded via worktreeColor
+	// so sessions sharing a worktree share a hue at a glance. Personal-fork
+	// expansion of the upstream branch-only badge — covers pre-created
+	// worktrees like MAIA.worker-N where WorktreeBranch is empty but the
+	// ProjectPath basename is the meaningful identifier.
+	//
+	// Suppressed when the folder already IS the primary label (e.g. an
+	// unnamed ro-dev session): repeating "ro-dev-2" as both the label and
+	// the chip is pure noise.
+	worktreeBadge := ""
+	if lbl.kind != primaryFolder {
+		worktreeBadge = renderWorktreeBadge(inst, selected)
 	}
 
 	// Sandbox badge for containerized sessions.
@@ -14840,81 +15492,69 @@ func (h *Home) renderSessionItem(
 		windowChevron = chevronStyle.Render(chevronChar)
 	}
 
-	// Auto-named quick sessions display Claude's live task description (the
-	// tmux pane title) in place of the random handle. instState.paneTitle is
-	// already cleaned by cleanPaneTitle, so an idle/just-started session (empty
-	// paneTitle) falls back to the handle automatically.
-	displayTitle := displaySessionTitle(inst, instState.paneTitle)
-	// Pin marker (pin-sessions): a 📌 prefix flags any pinned row. Position in
-	// the list conveys top vs bottom; the emoji conveys "this is pinned".
-	// Prepended before the AutoName truncation budget so width accounting below
-	// stays correct.
-	if inst.Pin != session.PinNone {
-		displayTitle = "📌 " + displayTitle
-	}
-	// Maestro (fleet supervisor): ⬢ glyph leads the title.
-	if isMaestro {
-		displayTitle = "⬢ " + displayTitle
-	}
-	if inst.GetAutoName() && listWidth > 0 {
-		// Task descriptions can be long; truncate to the row's free width so the
-		// tool label and badges stay on-row. Keep the reserved terms below in
-		// sync with the row format that follows.
-		reserved := leftGutterWidth + cellWidth(baseIndent) + cellWidth(selectionPrefix) +
-			cellWidth(treeStyle.Render(treeConnector)) + cellWidth(windowChevron) +
-			cellWidth(status) + 1 /* space before title */ + cellWidth(tool) +
-			cellWidth(maestroBadge) + cellWidth(yoloBadge) + cellWidth(worktreeBadge) +
-			cellWidth(sandboxBadge) + cellWidth(multiRepoBadge) + cellWidth(sshBadge) +
-			cellWidth(timestampBadge)
-		budget := listWidth - reserved - 1 // -1 trailing margin
-		if budget > 0 && cellWidth(displayTitle) > budget {
-			displayTitle = cellTruncate(displayTitle, budget, "…")
-		}
-	}
-	title := titleStyle.Render(displayTitle)
+	// Conductor-assigned attention priority chip (local fork). Placed right
+	// after the identity label so the tier the Ctrl+E switcher cares about is
+	// visible at a glance; empty for unset sessions so unprioritized rows are
+	// untouched. Sits before the tool/worktree badges, mirroring their
+	// variable-width append (primary is padded to its column, so the chip
+	// doesn't disturb name alignment).
+	priorityChip := priorityBadge(inst.Priority, selected)
 
-	// Build row: [gutter][baseIndent][selection][tree][chevron][status] [title] [tool] [badges]
-	// The leading gutter (leftGutterWidth) keeps sessions aligned with group
-	// rows, which reserve the same gutter for root hotkey numbers.
+	// Build row: [gutter][baseIndent][selection][tree][chevron][status] [primary] [P chip] [tool] [maestro] [badges] · [trailer]
+	// Personal-fork layout: one dynamically-chosen identity label, then the
+	// color-coded worktree chip, then the live activity trailer. The primary
+	// label carries its own leading space, so no literal separator here. The
+	// leading gutter (leftGutterWidth, upstream) keeps sessions aligned with
+	// group rows, which reserve the same gutter for root hotkey numbers. YOLO
+	// mode is folded into the tool word (see above), so there is no separate
+	// badge slot for it.
 	row := fmt.Sprintf(
-		"%s%s%s%s%s%s %s%s%s%s%s%s%s%s%s",
+		"%s%s%s%s%s%s%s%s%s%s%s%s%s",
 		strings.Repeat(" ", leftGutterWidth),
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
 		windowChevron,
 		status,
-		title,
+		primary,
+		priorityChip,
 		tool,
 		maestroBadge,
-		yoloBadge,
 		worktreeBadge,
 		sandboxBadge,
 		multiRepoBadge,
-		sshBadge,
-		timestampBadge,
 	)
+	// Personal-fork layout appends ssh + optional last-update timestamp badges
+	// after the identity columns (timestampBadge is "" unless enabled in config).
+	row += sshBadge + timestampBadge
 
-	// Append pane title filling remaining row space (only for the selected item).
-	// #937 v2: cellWidth/cellTruncate (not lipgloss.Width / ansi.Truncate)
-	// for both the row budget and the pane-title fit check. pane titles
-	// often surface tmux pane content which can contain keycap glyphs
-	// (#️⃣ 0️⃣–9️⃣ *️⃣) — uniseg reports those at 1 cell, terminals render 2,
-	// so the prior measurement let the trailing pane-title text overflow
-	// the panel and shove subsequent rows down by one cell. See
-	// internal/ui/cellwidth.go for the upstream disagreement.
-	if (selected || h.showPaneTitles) && instState.paneTitle != "" && !inst.GetAutoName() {
-		// Dual layout: sidebar is narrower than h.width (#937). Using full
-		// terminal width here overflows the SESSIONS pane, then lipgloss
-		// truncation disagrees from terminal cells — wrapped lines duplicate
-		// rows visually and mouseY→item indexing breaks until scroll settles.
+	// Trailing broadcast slot — always rendered (personal fork: the user
+	// wants the live activity visible on every row, not only the selected
+	// one). When the tmux pane title is empty (non-Claude tools, idle
+	// prompt, just-launched sessions), fall back to the session's status
+	// word so the slot is never blank.
+	//
+	// #937 v2: budget against listWidth (the SESSIONS sidebar width), NOT
+	// h.width — in the dual layout the sidebar is narrower than the full
+	// terminal, and using h.width overflows the pane; lipgloss truncation
+	// then disagrees with terminal cells and mouseY→item indexing breaks
+	// until scroll settles. cellWidth/cellTruncate (not lipgloss.Width)
+	// because pane titles can carry keycap/emoji glyphs uniseg under-reports.
+	//
+	// De-dup: when the pane title already won the primary label (primaryBroadcast,
+	// e.g. an active worker), repeating it here would read "Exploring X · Exploring
+	// X". Fall back to the status word so the slot stays informative without echoing.
+	trailingText := instState.paneTitle
+	if trailingText == "" || trailingText == lbl.text {
+		trailingText = string(instState.status)
+	}
+	if trailingText != "" {
 		remaining := listWidth - cellWidth(row) - 2 // -2 for trailing margin
-		if remaining > 10 {
-			pt := instState.paneTitle
-			if cellWidth(pt) > remaining {
-				pt = cellTruncate(pt, remaining, "…")
+		if remaining > 6 {
+			if cellWidth(trailingText) > remaining {
+				trailingText = cellTruncate(trailingText, remaining, "…")
 			}
-			row += DimStyle.Render(" " + pt)
+			row += DimStyle.Render(" · " + trailingText)
 		}
 	}
 
@@ -17330,6 +17970,64 @@ func (h *Home) sendOutputToSession(source, target *session.Instance) tea.Cmd {
 	}
 }
 
+// teardownSession resets the worktree (`gr`) and brings the docker stack down
+// (`make down`), then signals the UI to delete the session. The commands run
+// directly in the worktree via an interactive zsh — NOT typed into the agent —
+// so teardown works the same for any tool (Claude's `!` shell-escape doesn't
+// exist in Codex). `-i` loads ~/.zshrc so the `gr` shell function resolves.
+func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
+	id, title := s.ID, s.Title
+	dir := s.EffectiveWorkingDir()
+	return func() tea.Msg {
+		if dir == "" {
+			return teardownResultMsg{title: title, err: fmt.Errorf("no working dir")}
+		}
+		// `gr` derives the branch from cwd and resets it to origin/dev; `make
+		// down` stops the worktree's docker stack. Chained so a failed reset
+		// still doesn't leave the stack up only if reset succeeds — but we want
+		// the stack down regardless, so run them independently.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		cmd := teardownCommand(ctx, dir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// Cleanup is best-effort — a missing docker stack (e.g. ro-dev) or a
+			// failed reset shouldn't strand the session. Warn but still delete.
+			return teardownResultMsg{title: title, id: id, warn: fmt.Sprintf("%v: %s", err, lastLine(string(out)))}
+		}
+		return teardownResultMsg{title: title, id: id}
+	}
+}
+
+// teardownCommand builds the `gr; make down` cleanup command for dir. It uses an
+// interactive zsh (-i) so the user's `gr` shell function (defined in ~/.zshrc,
+// only sourced for interactive shells) is in scope. Crucially it starts the
+// child in its own session (Setsid) so it has NO controlling terminal: an
+// interactive shell otherwise enables job control and tcsetpgrp()s its
+// controlling terminal to the foreground. Inheriting agent-deck's terminal, it
+// stole the foreground process group, and agent-deck's next input read raised
+// SIGTTIN and stopped the TUI — the `y` hotkey "crash". Setpgid is not enough
+// (it keeps the controlling terminal); Setsid severs it. stdout/stderr are
+// captured by the caller's CombinedOutput and stdin defaults to /dev/null, so
+// nothing reaches the real terminal.
+func teardownCommand(ctx context.Context, dir string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "zsh", "-ic", "gr; make down")
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd
+}
+
+// lastLine returns the last non-blank line of s, trimmed — used to surface the
+// most relevant line of a failed command's combined output in a one-line toast.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
 // handleSessionPickerDialogKey handles key events when the session picker is visible.
 func (h *Home) handleSessionPickerDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -17382,10 +18080,27 @@ func (h *Home) openSessionSwitcher(fromID string, reattachOnCancel bool) {
 		}
 	}
 
+	// Identity labels: reuse the dashboard's computed primary labels (name /
+	// branch / worktree folder / live broadcast) so the switcher shows the same
+	// names + colors as the list. Fall back to a fresh computation for any
+	// session not in the last render snapshot.
+	labels := make(map[string]primaryLabel, len(instances))
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		if lbl, ok := h.primaryLabels[inst.ID]; ok && lbl.kind != primaryNone {
+			labels[inst.ID] = lbl
+			continue
+		}
+		labels[inst.ID] = primaryLabelFor(inst, h.getSessionRenderState(inst), nil)
+	}
+
 	h.sessionSwitcher.SetSize(h.width, h.height)
 	if !h.sessionSwitcher.Show(fromID, instances, subtitles) {
 		return
 	}
+	h.sessionSwitcher.labels = labels
 	h.sessionSwitcher.reattachOnCancel = reattachOnCancel
 	// Treat the opening Ctrl+S as the first advance so key-repeat that arrives
 	// right after the attach->TUI handoff is throttled instead of spinning.
@@ -17473,7 +18188,9 @@ func (h *Home) handleSessionSwitcherKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Detach key: leave the switcher (and any session), landing in the overview.
 		h.sessionSwitcher.Hide()
 		return h, nil
-	case "ctrl+s":
+	case "ctrl+s", "ctrl+w":
+		// ctrl+w is the local open key, so it also advances (tap-to-cycle, MRU-like);
+		// ctrl+s kept as the upstream alias.
 		h.sessionSwitcher.cycle(true, time.Now())
 		return h, h.armSwitcherCommit()
 	case "ctrl+a":

@@ -70,19 +70,9 @@ func TestHome_ZoxidePickerInitialized(t *testing.T) {
 	}
 }
 
-func TestHome_ZPressOpensPicker(t *testing.T) {
-	home := NewHome()
-
-	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
-
-	h, ok := model.(*Home)
-	if !ok {
-		t.Fatalf("expected *Home, got %T", model)
-	}
-	if !h.zoxidePicker.IsVisible() {
-		t.Fatal("expected picker to be visible after pressing z")
-	}
-}
+// Personal fork: 'z' is remapped to fork-with-dialog (quick-fork is on 'f'),
+// so upstream's "z opens the zoxide picker" test was removed. The zoxide
+// picker code stays wired but is currently unbound to any key on this fork.
 
 func TestHome_ZoxidePickerEscClosesWithoutCreating(t *testing.T) {
 	home := NewHome()

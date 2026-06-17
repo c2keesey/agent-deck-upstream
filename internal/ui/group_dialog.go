@@ -167,12 +167,17 @@ func (g *GroupDialog) ShowRename(currentPath, currentName string) {
 }
 
 // ShowMove shows the dialog for moving a session to a group path.
-func (g *GroupDialog) ShowMove(groupPaths []string) {
+// sessionID pins the dialog to the session that was under the cursor when
+// the dialog opened — without it, a background flatItems reshuffle while
+// the dialog is open would silently retarget the move to the wrong session
+// (the symptom: first attempt looks like a no-op, second always works).
+func (g *GroupDialog) ShowMove(groupPaths []string, sessionID string) {
 	g.visible = true
 	g.mode = GroupDialogMove
 	g.validationErr = ""
 	g.groupPaths = groupPaths
 	g.selected = 0
+	g.sessionID = sessionID
 }
 
 // ShowRenameSession shows the dialog for renaming a session

@@ -232,7 +232,7 @@ func TestSessionSwitcher_ViewRendersTitlesAndFooter(t *testing.T) {
 	sw.Show("a", mruThree(), subtitles)
 
 	view := sw.View()
-	for _, want := range []string{"Switch session", "alpha", "bravo", "charlie", "attach"} {
+	for _, want := range []string{"Switch Session", "alpha", "bravo", "charlie", "attach"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q", want)
 		}
@@ -251,14 +251,17 @@ func TestSessionSwitcher_FooterEscReflectsContext(t *testing.T) {
 	sw := NewSessionSwitcher()
 	sw.SetSize(80, 24)
 
+	// Local fork renders the footer as keycaps ("esc" styled separately from the
+	// label), so the key and label are split by ANSI codes — assert on the
+	// distinctive label word, which only appears in the Esc hint.
 	sw.Show("a", mruThree(), nil) // reattachOnCancel defaults to false (overview)
-	if v := sw.View(); !strings.Contains(v, "Esc close") || strings.Contains(v, "Esc back") {
-		t.Errorf("overview-opened footer should say 'Esc close', got:\n%s", v)
+	if v := sw.View(); !strings.Contains(v, "close") || strings.Contains(v, "back") {
+		t.Errorf("overview-opened footer should say esc 'close', got:\n%s", v)
 	}
 
 	sw.reattachOnCancel = true // opened while attached
-	if v := sw.View(); !strings.Contains(v, "Esc back") {
-		t.Errorf("attached-opened footer should say 'Esc back', got:\n%s", v)
+	if v := sw.View(); !strings.Contains(v, "back") {
+		t.Errorf("attached-opened footer should say esc 'back', got:\n%s", v)
 	}
 }
 

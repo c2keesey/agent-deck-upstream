@@ -1824,6 +1824,25 @@ func isSocketAcceptingConnections(socketPath string) bool {
 	return true
 }
 
+// ideaCaptureBindArgs returns the tmux argv that binds Ctrl+Alt+I (C-M-i) in the
+// root key table to a display-popup running `agent-deck idea`. The popup floats
+// over the running agent (no input is sent to it) and the subcommand resolves
+// the current session itself, so the bind is identical for every session and
+// safe to re-apply on each start. It is guarded to agentdeck-managed sessions.
+// exe is the absolute path to the agent-deck binary; an empty exe falls back to
+// a bare `agent-deck` (resolved on PATH).
+func ideaCaptureBindArgs(exe string) []string {
+	if exe == "" {
+		exe = "agent-deck"
+	}
+	popup := fmt.Sprintf("display-popup -E -w 60%% -h 40%% %s idea", shellescape.Quote(exe))
+	return []string{
+		"bind-key", "-n", "-T", "root", "C-M-i",
+		"if-shell", "-F", "#{m:agentdeck_*,#{session_name}}",
+		popup,
+	}
+}
+
 // Start creates and starts a tmux session.
 // By default, command is sent after session creation (legacy behavior).
 // When RunCommandAsInitialProcess is true, command is passed directly to tmux
@@ -2032,6 +2051,18 @@ func (s *Session) Start(command string) error {
 	_ = s.tmuxCmd("bind-key", "-n", "-T", "root", "C-q",
 		"if-shell", fmt.Sprintf("[ \"#{session_name}\" = \"%s\" ]", s.Name),
 		"detach-client", "").Run()
+
+	// Bind Ctrl+Alt+I (C-M-i) to quick "by-the-way" idea capture: a display-popup
+	// that floats `agent-deck idea` over the running agent without sending it any
+	// input. Reported unambiguously because extended-keys/csi-u are enabled above.
+	// The bind is session-agnostic (the subcommand self-resolves the session) and
+	// guarded to agentdeck-managed sessions, so re-running it per session is
+	// idempotent. See docs/plans/2026-06-14-quick-note-capture.md.
+	ideaExe, err := os.Executable()
+	if err != nil {
+		ideaExe = ""
+	}
+	_ = s.tmuxCmd(ideaCaptureBindArgs(ideaExe)...).Run()
 
 	// Apply user-specified tmux option overrides from config (after defaults).
 	// These are batched into a single call when multiple overrides are present.

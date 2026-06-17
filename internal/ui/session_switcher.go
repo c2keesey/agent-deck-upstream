@@ -34,9 +34,10 @@ type SessionSwitcher struct {
 	width, height    int
 	sessions         []*session.Instance // active sessions, MRU-ordered
 	cursor           int
-	fromID           string            // session the picker was opened from
-	subtitles        map[string]string // sessionID -> dim conversation/pane title (matches the overview)
-	reattachOnCancel bool              // Esc re-attaches to fromID (opened while attached) vs. just closing (opened from the overview)
+	fromID           string                  // session the picker was opened from
+	subtitles        map[string]string       // sessionID -> dim conversation/pane title (matches the overview)
+	labels           map[string]primaryLabel // sessionID -> dashboard primary label (name/branch/folder/broadcast); set by openSessionSwitcher
+	reattachOnCancel bool                    // Esc re-attaches to fromID (opened while attached) vs. just closing (opened from the overview)
 	// commitGen is bumped on every open/cycle/cancel so a stale idle-commit
 	// timer (scheduled before a later keypress) is ignored when it fires. It is
 	// intentionally monotonic — never reset — so a timer from a previous
@@ -143,6 +144,7 @@ func (s *SessionSwitcher) Hide() {
 	s.sessions = nil
 	s.fromID = ""
 	s.subtitles = nil
+	s.labels = nil
 	s.reattachOnCancel = false
 	s.lastCycleAt = time.Time{}
 }
@@ -176,87 +178,217 @@ func (s *SessionSwitcher) prev() {
 	}
 }
 
+// primaryLabelStyle styles a switcher row's identity label by the same rules the
+// dashboard row render uses, so the switcher matches the list: a real name uses
+// the plain text color, a distinguishing branch is purple, a worktree folder
+// takes its own worktree color, and a live broadcast / auto name fades to dim.
+// The selected row gets the accent highlight bar.
+func primaryLabelStyle(lbl primaryLabel, selected bool) lipgloss.Style {
+	switch {
+	case selected:
+		return SessionTitleSelStyle
+	case lbl.kind == primaryBranch:
+		return lipgloss.NewStyle().Foreground(ColorPurple).Bold(true)
+	case lbl.kind == primaryFolder:
+		return lipgloss.NewStyle().Foreground(worktreeColor(lbl.text)).Bold(true)
+	case lbl.kind == primaryBroadcast, lbl.kind == primaryAuto:
+		return lipgloss.NewStyle().Foreground(ColorTextDim)
+	default: // primaryName
+		return lipgloss.NewStyle().Foreground(ColorText)
+	}
+}
+
+// switcherMaxVisibleRows caps how many session rows render at once; when there
+// are more, a window centered on the cursor scrolls with "↑/↓ N more" markers.
+const switcherMaxVisibleRows = 12
+
 // View renders the centered switcher box.
 func (s *SessionSwitcher) View() string {
 	if !s.visible {
 		return ""
 	}
 
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(ColorAccent)
-	selectedStyle := lipgloss.NewStyle().
-		Foreground(ColorAccent).
-		Bold(true)
-	normalStyle := lipgloss.NewStyle().
-		Foreground(ColorText)
-	footerStyle := lipgloss.NewStyle().
-		Foreground(ColorComment).
-		Italic(true)
-
-	dialogWidth := 56
-	if s.width > 0 && s.width < dialogWidth+10 {
-		dialogWidth = s.width - 10
-		if dialogWidth < 30 {
-			dialogWidth = 30
-		}
+	dialogWidth := 70
+	if s.width > 0 && s.width < dialogWidth+8 {
+		dialogWidth = s.width - 8
+	}
+	if dialogWidth < 40 {
+		dialogWidth = 40
 	}
 	// Content area inside the rounded border + Padding(1,2): horizontal padding
-	// eats 4 cells. Truncating rows to this keeps long subtitles from wrapping.
+	// eats 4 cells.
 	contentWidth := dialogWidth - 4
-	if contentWidth < 10 {
-		contentWidth = 10
+	if contentWidth < 24 {
+		contentWidth = 24
 	}
+
+	total := len(s.sessions)
+
+	// Name column width: the widest label, clamped so the live-activity subtitle
+	// always keeps room. Aligns tools + subtitles into clean columns.
+	nameCol := 0
+	for _, inst := range s.sessions {
+		if w := cellWidth(s.labelText(inst)); w > nameCol {
+			nameCol = w
+		}
+	}
+	// Cap so one long label (often a live-broadcast activity sentence) can't push
+	// the subtitle column off the row; 24 keeps names compact yet readable.
+	nameCol = max(min(nameCol, min(24, contentWidth/2)), 10)
+
+	// --- header: title on the left, position on the right, then a rule ---
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+	head := titleStyle.Render("⇄  Switch Session")
+	pos := DimStyle.Render(fmt.Sprintf("%d/%d", s.cursor+1, total))
+	gap := max(contentWidth-cellWidth(head)-cellWidth(pos), 1)
 
 	var lines []string
-	lines = append(lines, titleStyle.Render("Switch session"))
-	lines = append(lines, "")
+	lines = append(lines, head+strings.Repeat(" ", gap)+pos)
+	lines = append(lines, lipgloss.NewStyle().Foreground(ColorBorder).Render(strings.Repeat("─", contentWidth)))
 
-	for i, inst := range s.sessions {
-		indicator := statusIndicator(inst.GetStatusThreadSafe())
-		tool := ""
-		if inst.Tool != "" {
-			tool = fmt.Sprintf(" (%s)", inst.Tool)
+	// --- scroll window centered on the cursor ---
+	start, end := 0, total
+	if total > switcherMaxVisibleRows {
+		start = max(s.cursor-switcherMaxVisibleRows/2, 0)
+		end = start + switcherMaxVisibleRows
+		if end > total {
+			end = total
+			start = end - switcherMaxVisibleRows
 		}
-		title := inst.Title + tool
+	}
+	if start > 0 {
+		lines = append(lines, DimStyle.Render(fmt.Sprintf("  ↑ %d more", start)))
+	}
 
-		marker := "  "
-		labelStyle := normalStyle
-		if i == s.cursor {
-			marker = "> "
-			labelStyle = selectedStyle
+	selBar := lipgloss.NewStyle().Background(ColorAccent).Foreground(ColorBg).Bold(true)
+
+	for i := start; i < end; i++ {
+		inst := s.sessions[i]
+		selected := i == s.cursor
+		status := inst.GetStatusThreadSafe()
+
+		// Identity label: reuse the dashboard's primary-label engine (name >
+		// distinguishing branch > worktree folder > live broadcast > auto) so
+		// the switcher shows the same names + colors as the list.
+		lbl, ok := s.labels[inst.ID]
+		if !ok || lbl.text == "" {
+			lbl = primaryLabel{text: inst.Title, kind: primaryName}
 		}
-		line := marker + indicator + " " + labelStyle.Render(title)
+		name := lbl.text
+		if cellWidth(name) > nameCol {
+			name = cellTruncate(name, nameCol, "…")
+		}
 
-		// Append the dim conversation/pane title (same text the overview shows
-		// next to an entry), truncated to the space left on the row.
-		if sub := s.subtitles[inst.ID]; sub != "" {
-			used := 2 + 1 + 1 + cellWidth(title) // marker + indicator + space + title
-			if remaining := contentWidth - used - 1; remaining >= 6 {
-				line += " " + DimStyle.Render(cellTruncate(sub, remaining, "…"))
+		// Tool name — hidden for the default "claude" (matches the dashboard).
+		toolName := ""
+		if inst.Tool != "" && inst.Tool != "claude" {
+			toolName = inst.Tool
+		}
+
+		// Live-activity subtitle, unless the broadcast already won the label.
+		sub := ""
+		if lbl.kind != primaryBroadcast {
+			sub = s.subtitles[inst.ID]
+		}
+
+		if selected {
+			// One uniform accent bar: build the row as plain text (so the bar's
+			// background paints evenly) and pad it to the full content width.
+			row := "▸ " + statusGlyph(status) + " " + padCells(name, nameCol)
+			used := 2 + 1 + 1 + nameCol
+			if toolName != "" {
+				row += " " + toolName
+				used += 1 + cellWidth(toolName)
+			}
+			if sub != "" {
+				if rem := contentWidth - used - 2; rem >= 6 {
+					row += "  " + cellTruncate(sub, rem, "…")
+				}
+			}
+			lines = append(lines, selBar.Render(padCells(row, contentWidth)))
+			continue
+		}
+
+		// Non-selected: per-kind colors, columns aligned.
+		row := "  " + statusIndicator(status) + " " +
+			primaryLabelStyle(lbl, false).Render(name) + strings.Repeat(" ", max(0, nameCol-cellWidth(name)))
+		used := 2 + 1 + 1 + nameCol
+		if toolName != "" {
+			row += GetToolStyle(toolName).Render(" " + toolName)
+			used += 1 + cellWidth(toolName)
+		}
+		if sub != "" {
+			if rem := contentWidth - used - 2; rem >= 6 {
+				row += "  " + DimStyle.Render(cellTruncate(sub, rem, "…"))
 			}
 		}
-		lines = append(lines, line)
+		lines = append(lines, row)
 	}
 
-	lines = append(lines, "")
-	// The forward/back cycle keys are fixed (the attach loop and
-	// handleSessionSwitcherKey both match Ctrl+S / Ctrl+A regardless of the
-	// configurable open binding), so the labels stay literal. Esc, however,
-	// re-attaches to the origin only when the picker was opened while attached;
-	// from the overview it just closes, so the hint reflects that.
-	escHint := "Esc close"
-	if s.reattachOnCancel {
-		escHint = "Esc back"
+	if end < total {
+		lines = append(lines, DimStyle.Render(fmt.Sprintf("  ↓ %d more", total-end)))
 	}
-	lines = append(lines, footerStyle.Render("Ctrl+S next · Ctrl+A prev"))
-	lines = append(lines, footerStyle.Render("↑/↓ browse · Enter attach · "+escHint))
+
+	// --- footer: keycap hints ---
+	lines = append(lines, "")
+	lines = append(lines, switcherFooter(s.reattachOnCancel))
 
 	content := strings.Join(lines, "\n")
-
-	box := DialogBoxStyle.
-		Width(dialogWidth).
-		Render(content)
-
+	box := DialogBoxStyle.Width(dialogWidth).Render(content)
 	return centerInScreen(box, s.width, s.height)
+}
+
+// labelText returns the precomputed primary-label text for inst, or its raw
+// title as a fallback (e.g. before openSessionSwitcher set the labels, or in tests).
+func (s *SessionSwitcher) labelText(inst *session.Instance) string {
+	if lbl, ok := s.labels[inst.ID]; ok && lbl.text != "" {
+		return lbl.text
+	}
+	return inst.Title
+}
+
+// statusGlyph is the uncolored status bullet, for the selected row's accent bar
+// where a single background style paints the whole line.
+func statusGlyph(st session.Status) string {
+	switch st {
+	case session.StatusRunning:
+		return "●"
+	case session.StatusWaiting:
+		return "◐"
+	case session.StatusIdle:
+		return "○"
+	default:
+		return "✕"
+	}
+}
+
+// padCells right-pads s with spaces to exactly target display cells, truncating
+// with an ellipsis if it is longer. Keeps switcher columns aligned.
+func padCells(s string, target int) string {
+	if w := cellWidth(s); w < target {
+		return s + strings.Repeat(" ", target-w)
+	}
+	return cellTruncate(s, target, "…")
+}
+
+// switcherFooter renders the key hints as keycaps (bright keys, dim labels).
+// The Esc hint reflects context: "esc back" re-attaches to the origin session
+// when the picker was opened while attached (reattachOnCancel), otherwise
+// "esc close" since opening from the overview just dismisses the picker.
+func switcherFooter(reattachOnCancel bool) string {
+	key := lipgloss.NewStyle().Foreground(ColorText).Bold(true)
+	desc := lipgloss.NewStyle().Foreground(ColorComment)
+	sep := desc.Render("   ")
+	escLabel := " close"
+	if reattachOnCancel {
+		escLabel = " back"
+	}
+	parts := []string{
+		key.Render("Ctrl+W") + desc.Render(" next"),
+		key.Render("Ctrl+A") + desc.Render(" prev"),
+		key.Render("↑↓") + desc.Render(" browse"),
+		key.Render("⏎") + desc.Render(" attach"),
+		key.Render("esc") + desc.Render(escLabel),
+	}
+	return strings.Join(parts, sep)
 }

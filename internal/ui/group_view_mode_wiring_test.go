@@ -153,8 +153,10 @@ func TestCycleGroupViewKeyTogglesMode(t *testing.T) {
 	if home.groupViewMode != session.GroupViewNormal {
 		t.Fatalf("expected initial mode Normal, got %v", home.groupViewMode)
 	}
+	// Local fork: cycle-group-view is bound to "V" (View), not upstream's "t"
+	// (taken by restart in the local keymap).
 	press := func() {
-		home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+		home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'V'}})
 	}
 	press()
 	if home.groupViewMode != session.GroupViewActiveTop {

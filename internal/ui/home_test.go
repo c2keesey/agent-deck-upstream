@@ -327,7 +327,7 @@ func TestHomeUpdateNewDialog(t *testing.T) {
 	home.width = 100
 	home.height = 30
 
-	// Press n to open new dialog
+	// Personal fork: 'n' opens the simple MaiaWorkerPicker, not the full NewDialog.
 	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}}
 	model, _ := home.Update(msg)
 
@@ -335,8 +335,11 @@ func TestHomeUpdateNewDialog(t *testing.T) {
 	if !ok {
 		t.Fatal("Update should return *Home")
 	}
-	if !h.newDialog.IsVisible() {
-		t.Error("New dialog should be visible after pressing n")
+	if !h.maiaWorkerPicker.IsVisible() {
+		t.Error("MAIA worker picker should be visible after pressing n")
+	}
+	if h.newDialog.IsVisible() {
+		t.Error("Full new dialog must NOT open from 'n' on this fork")
 	}
 }
 
@@ -489,6 +492,51 @@ func TestHomeRenameSessionComplete(t *testing.T) {
 	}
 }
 
+// TestHomeRenameSessionSetsTitleLocked pins the fix for the shared-worktree
+// naming leak: a user-chosen name must lock the title so Claude's session-name
+// sync (ReconcileTitleFromClaude — turn-boundary hook + on-attach) cannot
+// overwrite it. Without TitleLocked, two sessions in one worktree that share a
+// collided ClaudeSessionID reconcile to the same Claude name and the rename
+// appears to jump between rows.
+func TestHomeRenameSessionSetsTitleLocked(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	inst := session.NewInstance("original-name", "/tmp/project")
+	if inst.TitleLocked {
+		t.Fatal("precondition: fresh session must not be title-locked")
+	}
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instanceByID[inst.ID] = inst
+	home.instancesMu.Unlock()
+	home.groupTree = session.NewGroupTree(home.instances)
+	home.rebuildFlatItems()
+
+	sessionIdx := -1
+	for i, item := range home.flatItems {
+		if item.Type == session.ItemTypeSession {
+			sessionIdx = i
+			break
+		}
+	}
+	home.cursor = sessionIdx
+
+	// Open rename dialog, type a name, confirm.
+	home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	home.groupDialog.nameInput.SetValue("my-session")
+	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	h := model.(*Home)
+	if h.instances[0].Title != "my-session" {
+		t.Fatalf("Title = %q, want my-session", h.instances[0].Title)
+	}
+	if !h.instances[0].TitleLocked {
+		t.Error("TitleLocked = false after manual rename; a user-chosen name must lock the title so Claude's sync cannot overwrite it")
+	}
+}
+
 func TestHomeMoveSessionWithDuplicateGroupNamesUsesSelectedPath(t *testing.T) {
 	home := NewHome()
 	home.width = 100
@@ -527,13 +575,13 @@ func TestHomeMoveSessionWithDuplicateGroupNamesUsesSelectedPath(t *testing.T) {
 	}
 	home.cursor = sessionIdx
 
-	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'M'}})
+	model, _ := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	h, ok := model.(*Home)
 	if !ok {
 		t.Fatal("Update should return *Home")
 	}
 	if !h.groupDialog.IsVisible() || h.groupDialog.Mode() != GroupDialogMove {
-		t.Fatal("move dialog should be visible after pressing M on a session")
+		t.Fatal("move dialog should be visible after pressing 'o' on a session")
 	}
 
 	targetIdx := -1
@@ -1230,7 +1278,8 @@ func TestDeleteAndCloseSessionUseDistinctActions(t *testing.T) {
 
 	h.confirmDialog.Hide()
 
-	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	// Personal fork: close-session is remapped from 'D' to Ctrl+X.
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlX})
 	h, ok = model.(*Home)
 	if !ok {
 		t.Fatal("handleMainKey should return *Home")
@@ -1305,7 +1354,8 @@ func TestRemoteDeleteAndCloseUseDistinctActions(t *testing.T) {
 
 	h.confirmDialog.Hide()
 
-	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	// Personal fork: close-session is remapped from 'D' to Ctrl+X.
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlX})
 	h, ok = model.(*Home)
 	if !ok {
 		t.Fatal("handleMainKey should return *Home")
@@ -1330,7 +1380,8 @@ func TestRemoteRestartReturnsRemoteCommand(t *testing.T) {
 	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
 	home.cursor = 0
 
-	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	// Personal fork: restart is remapped from 'R' (Shift+R) to 't'.
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 	h, ok := model.(*Home)
 	if !ok {
 		t.Fatal("handleMainKey should return *Home")
@@ -1469,9 +1520,11 @@ func TestRemoteSelectionQuickCreateStillRunsRemoteCommand(t *testing.T) {
 	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
 	home.cursor = 0
 
-	_, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	// Local fork: quick-create is bound to 'a' (upstream's quick-approve is
+	// parked on ctrl+a since the user runs bypass-permissions).
+	_, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	if cmd == nil {
-		t.Fatal("pressing N on remote selection should return remote create command")
+		t.Fatal("pressing 'a' on remote selection should return remote create command")
 	}
 
 	msg := cmd()
@@ -1704,8 +1757,9 @@ func TestRenderHelpBarMinimalWithSession(t *testing.T) {
 	if !strings.Contains(result, "n") {
 		t.Error("Minimal help bar should contain n key")
 	}
-	if !strings.Contains(result, "R") {
-		t.Error("Minimal help bar should contain R key for restart")
+	// Personal fork: restart key is 't', not 'R'.
+	if !strings.Contains(result, "t") {
+		t.Error("Minimal help bar should contain t key for restart")
 	}
 	// Should NOT contain full descriptions
 	if strings.Contains(result, "Attach") {
@@ -2083,8 +2137,13 @@ func TestCuratedFooterAlwaysEndsWithSettingsThenHelp(t *testing.T) {
 
 	settingsKey := home.actionKey(hotkeySettings)
 	helpKey := home.actionKey(hotkeyHelp)
-	si := strings.LastIndex(result, settingsKey+" ")
-	hi := strings.LastIndex(result, helpKey+" ")
+	// Match the rendered label tokens, not just key+" ": the personal-fork
+	// footer right-pads to the panel width, and the word "help" ends in "p "
+	// — so LastIndex(result, "p ") false-matches inside "help " and reports
+	// settings *after* help even though the row reads "p settings  ? help".
+	// Anchoring on the labels checks the real "settings before help" intent.
+	si := strings.LastIndex(result, settingsKey+" settings")
+	hi := strings.LastIndex(result, helpKey+" help")
 	if si == -1 {
 		t.Fatalf("curated footer should advertise settings key %q\nGot: %q", settingsKey, result)
 	}

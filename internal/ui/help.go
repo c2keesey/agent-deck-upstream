@@ -170,17 +170,18 @@ func (h *HelpOverlay) View() string {
 	reorderDownKeys := "- / J / Shift+↓"
 	indentKeys := "Shift+→/←"
 	searchKey := h.key(hotkeySearch, "/")
-	settingsKey := h.key(hotkeySettings, "S")
+	settingsKey := h.key(hotkeySettings, "p")
 	helpKey := h.key(hotkeyHelp, "?")
 	quitKey := h.key(hotkeyQuit, "q")
 	importKey := h.key(hotkeyImport, "i")
 	reloadKey := h.key(hotkeyReload, "Ctrl+R")
 	deleteKey := h.key(hotkeyDelete, "d")
-	closeKey := h.key(hotkeyCloseSession, "D")
-	restartKey := h.key(hotkeyRestart, "Shift+R")
+	closeKey := h.key(hotkeyCloseSession, "Ctrl+X")
+	restartKey := h.key(hotkeyRestart, "t")
+	hardRestartKey := h.key(hotkeyHardRestart, "Ctrl+T")
 	restartFreshKey := h.key(hotkeyRestartFresh, "Shift+T")
 	renameKey := h.key(hotkeyRename, "r")
-	moveKey := h.key(hotkeyMoveToGroup, "M")
+	moveKey := h.key(hotkeyMoveToGroup, "o")
 	mcpKey := h.key(hotkeyMCPManager, "m")
 	pluginKey := h.key(hotkeyPluginManager, "L")
 	skillsKey := h.key(hotkeySkillsManager, "s")
@@ -191,21 +192,24 @@ func (h *HelpOverlay) View() string {
 	promptSessionKey := h.key(hotkeyPromptSession, "o")
 	copyKey := h.key(hotkeyCopyOutput, "c")
 	sendKey := h.key(hotkeySendOutput, "x")
-	execShellKey := h.key(hotkeyExecShell, "E")
+	execShellKey := h.key(hotkeyExecShell, "b")
 	notesKey := h.key(hotkeyEditNotes, "e")
 	if cfg, _ := session.LoadUserConfig(); cfg != nil && !cfg.GetShowNotes() {
 		notesKey = ""
 	}
 	editPathsKey := h.key(hotkeyEditPaths, "p")
-	editSessionKey := h.key(hotkeyEditSession, "P")
-	worktreeSetupKey := h.key(hotkeyWorktreeSetup, "b")
-	worktreeKey := h.key(hotkeyWorktreeFinish, "W")
+	editSessionKey := h.key(hotkeyEditSession, "")
+	worktreeSetupKey := h.key(hotkeyWorktreeSetup, "")
+	worktreeKey := h.key(hotkeyWorktreeFinish, "w")
 	watcherPanelKey := h.key(hotkeyWatcherPanel, "w")
 	groupKey := h.key(hotkeyCreateGroup, "g")
 	undoKey := h.key(hotkeyUndoDelete, "Ctrl+Z")
 	archiveKey := h.key(hotkeyArchiveSession, "A")
 	unarchiveKey := h.key(hotkeyUnarchiveSession, "Shift+U")
 	viewArchivedKey := h.key(hotkeyViewArchived, "^")
+	mruKey := h.key(hotkeyMRUCycle, "Ctrl+W")
+	attentionKey := h.key(hotkeyAttentionCycle, "Ctrl+E")
+	teardownKey := h.key(hotkeyTeardown, "y")
 
 	sections := []struct {
 		title string
@@ -225,6 +229,8 @@ func (h *HelpOverlay) View() string {
 				{"l / Right", "Expand / toggle"},
 				{"1-9", "Jump to root group"},
 				{"Space", "Jump mode"},
+				{mruKey, "Cycle recent sessions"},
+				{attentionKey, "Cycle ready sessions by priority"},
 				{"Enter", "Attach / toggle"},
 				{"Shift+Enter", "Open session in new iTerm window (macOS)"},
 			},
@@ -244,7 +250,9 @@ func (h *HelpOverlay) View() string {
 				{newKeys, "New / quick create"},
 				{renameKey, "Rename session"},
 				{restartKey, "Restart session"},
+				{hardRestartKey, "Hard restart (fresh session)"},
 				{restartFreshKey, "Restart with new session ID"},
+				{teardownKey, "Teardown (gr + make down, then delete)"},
 				{deleteKey, "Delete session"},
 				{closeKey, "Close session process"},
 				{undoKey, "Undo delete"},

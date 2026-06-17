@@ -1,4 +1,4 @@
-// Issue #1369: quick-approve (`a`) must act on the window the cursor is on,
+// Issue #1369: quick-approve (ctrl+a in this fork) must act on the window the cursor is on,
 // gating on that window's detected tool (WindowTool) rather than the session's
 // stored Tool, and delivering to that specific window index. These tests pin
 // the dispatch at the handleMainKey boundary with an injected sink, mirroring
@@ -64,13 +64,14 @@ func armHomeWithOneWindowRow(t *testing.T, windowTool string, windowIndex int) (
 	return home, inst, capture
 }
 
-// TestQuickApprove_ClaudeWindowRow_TargetsThatWindow: pressing `a` on a window
-// sub-row whose WindowTool is claude must dispatch to that exact window index —
-// even though the parent session's Tool is "shell".
+// TestQuickApprove_ClaudeWindowRow_TargetsThatWindow: pressing the quick-approve
+// key on a window sub-row whose WindowTool is claude must dispatch to that exact
+// window index — even though the parent session's Tool is "shell". Local fork:
+// quick-approve is on ctrl+a ('a' is quick-create here).
 func TestQuickApprove_ClaudeWindowRow_TargetsThatWindow(t *testing.T) {
 	home, inst, capture := armHomeWithOneWindowRow(t, "claude", 3)
 
-	home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	home.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlA})
 
 	if len(capture.calls) != 1 {
 		t.Fatalf("expected exactly 1 quick-approve dispatch, got %d: %+v", len(capture.calls), capture.calls)
@@ -84,13 +85,14 @@ func TestQuickApprove_ClaudeWindowRow_TargetsThatWindow(t *testing.T) {
 	}
 }
 
-// TestQuickApprove_NonClaudeWindowRow_NoOp: pressing `a` on a window sub-row
-// whose WindowTool is not Claude-compatible must NOT dispatch — the gate keys
-// off the window's tool, so a stray press on e.g. a shell window is inert.
+// TestQuickApprove_NonClaudeWindowRow_NoOp: pressing the quick-approve key on a
+// window sub-row whose WindowTool is not Claude-compatible must NOT dispatch —
+// the gate keys off the window's tool, so a stray press on e.g. a shell window
+// is inert. Local fork: quick-approve is on ctrl+a.
 func TestQuickApprove_NonClaudeWindowRow_NoOp(t *testing.T) {
 	home, _, capture := armHomeWithOneWindowRow(t, "shell", 2)
 
-	home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	home.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlA})
 
 	if len(capture.calls) != 0 {
 		t.Fatalf("expected no dispatch for a non-claude window, got %+v", capture.calls)

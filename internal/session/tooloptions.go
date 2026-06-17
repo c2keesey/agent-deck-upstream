@@ -20,6 +20,8 @@ type ClaudeOptions struct {
 	SessionMode string `json:"session_mode,omitempty"`
 	// ResumeSessionID is the session ID for -r flag (only when SessionMode="resume")
 	ResumeSessionID string `json:"resume_session_id,omitempty"`
+	// UseHappy launches Claude via the happy wrapper
+	UseHappy bool `json:"use_happy,omitempty"`
 	// Model overrides the Claude model for this session. Aliases like "sonnet",
 	// "opus", and "haiku" let Claude Code resolve the latest version; full
 	// model IDs pin a specific version.
@@ -118,6 +120,7 @@ func NewClaudeOptions(config *UserConfig) *ClaudeOptions {
 		SessionMode: "new",
 	}
 	if config != nil {
+		opts.UseHappy = config.Claude.UseHappy
 		opts.SkipPermissions = config.Claude.GetDangerousMode()
 		opts.AutoMode = config.Claude.AutoMode
 		opts.AllowSkipPermissions = config.Claude.AllowDangerousMode
@@ -140,6 +143,9 @@ type CodexOptions struct {
 	// YoloMode enables --yolo flag (bypass approvals and sandbox)
 	// nil = inherit from global config, true/false = explicit override
 	YoloMode *bool `json:"yolo_mode,omitempty"`
+	// UseHappy launches Codex via "happy codex"
+	// nil = inherit from global config, true/false = explicit override
+	UseHappy *bool `json:"use_happy,omitempty"`
 }
 
 // ToolName returns "codex"
@@ -165,6 +171,10 @@ func NewCodexOptions(config *UserConfig) *CodexOptions {
 	if config != nil && config.Codex.YoloMode {
 		yolo := true
 		opts.YoloMode = &yolo
+	}
+	if config != nil && config.Codex.UseHappy {
+		useHappy := true
+		opts.UseHappy = &useHappy
 	}
 	return opts
 }

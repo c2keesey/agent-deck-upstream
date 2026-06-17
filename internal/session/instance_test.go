@@ -506,6 +506,106 @@ config_dir = "~/.claude-work"
 	}
 }
 
+func TestBuildClaudeCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("happy-claude", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "exec happy --session-id") {
+		t.Errorf("Should launch Claude via happy when use_happy=true, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_CustomAliasWinsOverHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+command = "cdw"
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("alias-claude", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "cdw") {
+		t.Errorf("Should use custom Claude command when configured, got: %s", cmd)
+	}
+	if strings.Contains(cmd, "exec happy") {
+		t.Errorf("Custom Claude command should win over happy, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_PerSessionUseHappyOverride(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("plain-claude", "/tmp/test", "claude")
+	if err := inst.SetClaudeOptions(&ClaudeOptions{SessionMode: "new", UseHappy: false}); err != nil {
+		t.Fatalf("SetClaudeOptions failed: %v", err)
+	}
+
+	cmd := inst.buildClaudeCommand("claude")
+	if strings.Contains(cmd, "exec happy") {
+		t.Errorf("Per-session UseHappy=false should override global config, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "exec claude --session-id") {
+		t.Errorf("Expected plain claude command when per-session UseHappy=false, got: %s", cmd)
+	}
+}
+
 // TestBuildClaudeCommand_SubagentAddDir tests that subagents get --add-dir
 // for access to parent's project directory (for worktrees, etc.)
 func TestBuildClaudeCommand_SubagentAddDir(t *testing.T) {
@@ -690,8 +790,8 @@ func TestInstance_UpdateClaudeSession_TmuxFirst(t *testing.T) {
 }
 
 // TestInstance_UpdateClaudeSession_PreservesExistingID verifies that existing
-// session IDs from storage are preserved when tmux env is empty.
-// With the new tmux-only approach, we only update when tmux env has a value.
+// session IDs from storage are preserved and detection time is refreshed
+// (self-heal) when tmux env is empty but we have a stored session ID.
 func TestInstance_UpdateClaudeSession_PreservesExistingID(t *testing.T) {
 	// Create instance with known session ID (simulating loaded from storage)
 	inst := NewInstanceWithTool("preserve-id-test", "/tmp", "claude")
@@ -700,18 +800,21 @@ func TestInstance_UpdateClaudeSession_PreservesExistingID(t *testing.T) {
 	oldDetectedAt := time.Now().Add(-10 * time.Minute)
 	inst.ClaudeDetectedAt = oldDetectedAt
 
-	// Call UpdateClaudeSession - without tmux session, nothing should change
+	// Call UpdateClaudeSession - without tmux session, self-heal should refresh detection time
 	inst.UpdateClaudeSession(nil)
 
-	// Existing session ID must be preserved (tmux env is empty, so no change)
+	// Existing session ID must be preserved
 	if inst.ClaudeSessionID != existingID {
 		t.Errorf("ClaudeSessionID was changed from %q to %q - should preserve stored ID when tmux env is empty",
 			existingID, inst.ClaudeSessionID)
 	}
 
-	// Timestamp should NOT change (no tmux env = no update)
-	if inst.ClaudeDetectedAt != oldDetectedAt {
-		t.Error("ClaudeDetectedAt should not change when tmux env is empty")
+	// Detection time should be refreshed (self-heal keeps fork/restart available)
+	if inst.ClaudeDetectedAt == oldDetectedAt {
+		t.Error("ClaudeDetectedAt should be refreshed by self-heal when session ID exists but tmux env is empty")
+	}
+	if time.Since(inst.ClaudeDetectedAt) > 5*time.Second {
+		t.Error("ClaudeDetectedAt should be recent after self-heal")
 	}
 }
 
@@ -3237,6 +3340,147 @@ func TestBuildClaudeCommand_ExportsInstanceID(t *testing.T) {
 	expectedPrefix := "AGENTDECK_INSTANCE_ID=" + inst.ID
 	if !strings.Contains(cmd, expectedPrefix) {
 		t.Errorf("Command should contain %q, got: %s", expectedPrefix, cmd)
+	}
+}
+
+func TestBuildCodexCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[codex]
+use_happy = true
+yolo_mode = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("happy-codex", "/tmp/test", "codex")
+	cmd := inst.buildCodexCommand("codex")
+
+	if !strings.Contains(cmd, "happy codex --yolo") {
+		t.Errorf("Should launch Codex via happy with yolo flag, got: %s", cmd)
+	}
+}
+
+func TestBuildCodexCommand_PerSessionUseHappyOverride(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[codex]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("plain-codex", "/tmp/test", "codex")
+	inst.CodexSessionID = "codex-session-123"
+	if err := inst.SetCodexOptions(&CodexOptions{
+		YoloMode: boolPtr(true),
+		UseHappy: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("SetCodexOptions failed: %v", err)
+	}
+
+	cmd := inst.buildCodexCommand("codex")
+
+	if strings.Contains(cmd, "happy codex") {
+		t.Errorf("Per-session UseHappy=false should override global config, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "codex --yolo resume codex-session-123") {
+		t.Errorf("Expected plain codex resume command with yolo, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeResumeCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("resume-happy", "/tmp/test", "claude")
+	inst.ClaudeSessionID = "resume-session-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	cmd := inst.buildClaudeResumeCommand()
+	if !strings.Contains(cmd, "happy --session-id resume-session-123") &&
+		!strings.Contains(cmd, "happy --resume resume-session-123") {
+		t.Errorf("Resume command should use happy when configured, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeForkCommandForTarget_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	parent := NewInstanceWithTool("parent", "/tmp/test", "claude")
+	parent.ClaudeSessionID = "parent-session-123"
+	parent.ClaudeDetectedAt = time.Now()
+	target := NewInstanceWithTool("fork", "/tmp/test", "claude")
+
+	cmd, err := parent.buildClaudeForkCommandForTarget(target, nil)
+	if err != nil {
+		t.Fatalf("buildClaudeForkCommandForTarget failed: %v", err)
+	}
+	if !strings.Contains(cmd, "exec happy --session-id") {
+		t.Errorf("Fork command should use happy when configured, got: %s", cmd)
 	}
 }
 

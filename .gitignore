@@ -48,9 +48,12 @@ Thumbs.db
 .serena/
 
 # Personal/local files
+CLAUDE.md
 .mcp.json
 .playwright-mcp/
 *.screenstudio/
+.ad-sync.log
+excalidraw.log
 
 .worktrees
 .worktree/

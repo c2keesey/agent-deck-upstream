@@ -47,8 +47,8 @@ func handleLaunch(profile string, args []string) {
 	// Worktree flags
 	worktreeBranch := fs.String("w", "", "Create session in git worktree for branch")
 	worktreeBranchLong := fs.String("worktree", "", "Create session in git worktree for branch")
-	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree)")
-	newBranchLong := fs.Bool("new-branch", false, "Create new branch")
+	newBranch := fs.Bool("b", false, "Create new branch if needed (reuse existing branch when present)")
+	newBranchLong := fs.Bool("new-branch", false, "Create new branch if needed (reuse existing branch when present)")
 	worktreeLocation := fs.String("location", "", "Worktree location: sibling, subdirectory, or custom path")
 
 	// MCP flag
@@ -101,6 +101,9 @@ func handleLaunch(profile string, args []string) {
 
 	// Issue #1143: auto-stop dormant child sessions.
 	idleTimeout := fs.String("idle-timeout", "", "Auto-stop session after this duration of no tmux output (Go duration: 30m, 1h, 24h). 0 or unset = disabled")
+
+	// Local fork: conductor-assigned priority tier for the Ctrl+E attention cycle.
+	priority := fs.String("priority", "", "Attention-cycle priority tier (1 = highest .. 3 = lowest; 0 or unset = none)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck launch [path] [options]")
@@ -420,6 +423,14 @@ func handleLaunch(profile string, args []string) {
 		os.Exit(1)
 	} else {
 		newInstance.IdleTimeoutSecs = idleSecs
+	}
+
+	// Local fork: --priority N → Instance.Priority, read by the Ctrl+E cycle.
+	if prio, err := session.ParsePriorityFlag(strings.TrimSpace(*priority)); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	} else {
+		newInstance.Priority = prio
 	}
 
 	if *resumeSession != "" {

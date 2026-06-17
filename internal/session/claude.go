@@ -1,8 +1,10 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -411,6 +413,147 @@ func envClaudeConfigDirIgnoringScratchLeak() string {
 func GetClaudeConfigDir() string {
 	path, _ := resolveClaudeConfigDir(resolveOpts{})
 	return path
+}
+
+// LastClaudeChatAnchor returns the last line of the most recent text-bearing
+// message — user OR assistant — in a Claude Code session transcript. It is a
+// lightweight locating anchor: just enough for someone revisiting the backlog to
+// grep back to where in the conversation the note was taken, not the full
+// message. Returns "" with a nil error when the transcript can't be found or
+// holds no message text, so callers may treat empty as "no context available".
+//
+// Whichever side spoke last wins — capturing right after you type but before the
+// agent replies anchors on your line; right after the agent replies, on its
+// line. The most recent message sits at the tail of the transcript, so a modest
+// tail read reaches it reliably.
+func LastClaudeChatAnchor(claudeSessionID, projectPath string) (string, error) {
+	if claudeSessionID == "" {
+		return "", nil
+	}
+	configDir := GetClaudeConfigDir()
+	resolved := projectPath
+	if r, err := filepath.EvalSymlinks(projectPath); err == nil {
+		resolved = r
+	}
+	encoded := ConvertToClaudeDirName(resolved)
+	path := filepath.Join(configDir, "projects", encoded, claudeSessionID+".jsonl")
+
+	// 128 KB tail: the most recent message record sits at the very end of the
+	// transcript, so a small tail reaches it. We only need an anchor line, not the
+	// whole message, so there's no reason to read the megabytes a full reply would.
+	data, ok := readTranscriptTail(path, 128*1024)
+	if !ok {
+		return "", nil
+	}
+	return lastNonEmptyLine(parseClaudeLastMessageText(data)), nil
+}
+
+// parseClaudeLastMessageText returns the full text of the most recent message
+// (user or assistant) in the JSONL data. Tool-only records (tool_use /
+// tool_result carry no text block) and subagent sidechain records are skipped,
+// so the result is a human-meaningful line, not machinery.
+func parseClaudeLastMessageText(data []byte) string {
+	type claudeMessage struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	type claudeRecord struct {
+		Message     json.RawMessage `json:"message"`
+		IsSidechain bool            `json:"isSidechain"`
+	}
+
+	var lastText string
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var record claudeRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			continue
+		}
+		if record.IsSidechain || len(record.Message) == 0 {
+			continue
+		}
+		var msg claudeMessage
+		if err := json.Unmarshal(record.Message, &msg); err != nil {
+			continue
+		}
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+
+		// Content is either a plain string or an array of blocks; we want text.
+		var text string
+		var contentStr string
+		if err := json.Unmarshal(msg.Content, &contentStr); err == nil {
+			text = contentStr
+		} else {
+			var blocks []map[string]interface{}
+			if err := json.Unmarshal(msg.Content, &blocks); err == nil {
+				var sb strings.Builder
+				for _, block := range blocks {
+					if bt, ok := block["type"].(string); ok && bt == "text" {
+						if t, ok := block["text"].(string); ok {
+							sb.WriteString(t)
+							sb.WriteString("\n")
+						}
+					}
+				}
+				text = strings.TrimSpace(sb.String())
+			}
+		}
+		if text != "" {
+			lastText = text
+		}
+	}
+	return lastText
+}
+
+// lastNonEmptyLine returns the final non-blank line of s, trimmed.
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// readTranscriptTail reads up to the last n bytes of path, trimmed forward to
+// the first complete line boundary. Returns ok=false when the file can't be
+// read. Mirrors the tail-read strategy of (*Instance).readJSONLTail without its
+// per-instance caching.
+func readTranscriptTail(path string, n int64) ([]byte, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+
+	offset := info.Size() - n
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return nil, false
+		}
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, false
+	}
+	if offset > 0 {
+		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+			data = data[idx+1:]
+		}
+	}
+	return data, true
 }
 
 // IsClaudeConfigDirExplicit returns true when any priority level (env,

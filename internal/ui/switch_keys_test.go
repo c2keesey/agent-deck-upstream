@@ -3,8 +3,11 @@ package ui
 import "testing"
 
 func TestResolvedSwitchByte_Default(t *testing.T) {
-	if got := ResolvedSwitchByte(nil); got != 0x13 {
-		t.Errorf("default switch byte = %#x, want Ctrl+S (0x13)", got)
+	// Local fork: switch_session is remapped to Ctrl+W (upstream defaults it to
+	// Ctrl+S, which is XOFF / what some terminals send for Cmd+Right). The
+	// MRU-ordered switcher replaces the old blind MRU cursor-cycle on Ctrl+W.
+	if got := ResolvedSwitchByte(nil); got != 'w'-'a'+1 {
+		t.Errorf("default switch byte = %#x, want Ctrl+W (0x17)", got)
 	}
 }
 

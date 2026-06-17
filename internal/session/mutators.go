@@ -34,6 +34,7 @@ const (
 	FieldAutoMode           = "auto-mode"
 	FieldAccount            = "account"      // #924 per-session named account slot
 	FieldIdleTimeout        = "idle-timeout" // #1143 auto-stop dormant sessions
+	FieldPriority           = "priority"     // local fork: Ctrl+E attention cycle tier
 	FieldPin                = "pin"          // pin-sessions: anchor top/bottom of group
 	// FieldModel persists the operator's selected per-session model (#1436,
 	// follow-up to #1431). Tool-agnostic: routes to each tool's existing model
@@ -66,6 +67,7 @@ var ValidMutableFields = []string{
 	FieldAutoMode,
 	FieldAccount,
 	FieldIdleTimeout,
+	FieldPriority,
 	FieldPin,
 	FieldModel,
 }
@@ -389,6 +391,16 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		} else if aerr := inst.ApplyLaunchModel(trimmed); aerr != nil {
 			return oldValue, nil, &MutationError{Field: field, Msg: aerr.Error()}
 		}
+
+	case FieldPriority:
+		// Local fork: conductor-assigned importance tier (0 clears, 1..3).
+		// Live — the next Ctrl+E snapshot and status nudge read the new value.
+		oldValue = strconv.Itoa(inst.Priority)
+		prio, perr := ParsePriorityFlag(strings.TrimSpace(value))
+		if perr != nil {
+			return oldValue, nil, &MutationError{Field: field, Msg: perr.Error()}
+		}
+		inst.Priority = prio
 
 	case FieldPin:
 		// pin-sessions: anchor the session to the top/bottom of its group,

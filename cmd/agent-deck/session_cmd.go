@@ -767,6 +767,13 @@ func handleSessionFork(profile string, args []string) {
 		wtSettings := session.GetWorktreeSettings()
 		wtBranch = wtSettings.ApplyBranchPrefix(wtBranch)
 
+		// Local guard: reject syntactically invalid branch names for all forks
+		// before the destination gate below.
+		if err := git.ValidateBranchName(wtBranch); err != nil {
+			out.Error(fmt.Sprintf("invalid branch name: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+
 		// Destination gate (BUG-01/08). With-state forks create a NEW branch
 		// anchored at the parent's HEAD, so they must refuse any pre-existing
 		// branch or worktree — one well-defined collision gate, evaluated before
@@ -1364,6 +1371,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
 		fmt.Println("  account            Named account slot (#924) — resolves via [profiles.<account>.claude].config_dir; restart required")
 		fmt.Println("  idle-timeout       Auto-stop after no tmux output for this duration (#1143; Go duration: 30m, 1h, 24h; 0 disables)")
+		fmt.Println("  priority           Attention-cycle tier for Ctrl+E (1 = highest .. 3 = lowest; 0 clears)")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()

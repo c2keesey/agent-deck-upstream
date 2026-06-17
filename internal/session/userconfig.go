@@ -1153,6 +1153,11 @@ type ClaudeSettings struct {
 	// This allows using shell aliases that set CLAUDE_CONFIG_DIR automatically
 	Command string `toml:"command,omitempty"`
 
+	// UseHappy launches Claude via the happy wrapper by default.
+	// Ignored when Command is set to a custom alias or command.
+	// Default: false
+	UseHappy bool `toml:"use_happy"`
+
 	// ConfigDir is the path to Claude's config directory
 	// Default: ~/.claude (or CLAUDE_CONFIG_DIR env var)
 	ConfigDir string `toml:"config_dir,omitempty"`
@@ -1416,6 +1421,10 @@ type CodexSettings struct {
 	// YoloMode enables --yolo flag for Codex sessions (bypass approvals and sandbox)
 	// Default: false
 	YoloMode bool `toml:"yolo_mode,omitempty"`
+
+	// UseHappy launches Codex via "happy codex" by default.
+	// Default: false
+	UseHappy bool `toml:"use_happy"`
 
 	// EnvFile is a .env file specific to Codex sessions
 	// Sourced AFTER global [shell].env_files
@@ -3525,6 +3534,8 @@ func CreateExampleConfig() error {
 # config_dir = "~/.claude-work"
 # Enable --dangerously-skip-permissions by default (default: false)
 # dangerous_mode = true
+# Launch Claude via happy by default (default: false)
+# use_happy = true
 # Extra Claude CLI flags remembered from the New Session dialog
 # extra_args = ["--agent", "reviewer"]
 # Default model preselected for new sessions (must be a known catalog model)
@@ -3557,6 +3568,8 @@ func CreateExampleConfig() error {
 # config_dir = "~/.codex-work"
 # Enable --yolo (bypass approvals and sandbox) by default (default: false)
 # yolo_mode = true
+# Launch Codex via happy by default (default: false)
+# use_happy = true
 
 # Log file management
 # Agent-deck logs session output to ~/.agent-deck/logs/ for status detection

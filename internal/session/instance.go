@@ -329,10 +329,10 @@ type Instance struct {
 	// so existing sessions are unaffected on upgrade.
 	IdleTimeoutSecs int64 `json:"idle_timeout_secs,omitempty"`
 
-	// Priority (local fork) is the conductor-assigned importance tier that
-	// drives the Ctrl+E attention cycle and the higher-priority-ready status
-	// nudge. 0 = unset, 1 (highest) .. 3 (lowest). Persisted via the
-	// tool_data extras zone (see priority.go) so legacy binaries round-trip
+	// Priority (local fork) is the conductor-assigned strict rank that drives
+	// the Ctrl+E attention cycle and the higher-priority-ready status nudge.
+	// 1 = highest, unique per session, no upper bound; 0 = unset. Persisted via
+	// the tool_data extras zone (see priority.go) so legacy binaries round-trip
 	// it untouched. Default 0 leaves Ctrl+E ordering by longest-waiting.
 	Priority int `json:"priority,omitempty"`
 

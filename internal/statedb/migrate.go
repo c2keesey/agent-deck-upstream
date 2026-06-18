@@ -103,7 +103,7 @@ type toolDataBlob struct {
 	MultiRepoWorktrees []multiRepoWorktreeBlob `json:"multi_repo_worktrees,omitempty"`
 	// Presentation
 	Color string `json:"color,omitempty"` // issue #391 — per-session TUI row tint
-	// Priority (local fork): conductor-assigned Ctrl+E attention tier (1..3).
+	// Priority (local fork): conductor-assigned Ctrl+E attention strict rank (1 = highest, unbounded).
 	// Modeled here so MergeToolDataExtras treats it as an authoritative known
 	// key — letting an explicit clear (key absent in the new blob) win instead
 	// of carrying the stale value forward from the old row. The value itself

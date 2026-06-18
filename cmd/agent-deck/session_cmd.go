@@ -1371,7 +1371,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
 		fmt.Println("  account            Named account slot (#924) — resolves via [profiles.<account>.claude].config_dir; restart required")
 		fmt.Println("  idle-timeout       Auto-stop after no tmux output for this duration (#1143; Go duration: 30m, 1h, 24h; 0 disables)")
-		fmt.Println("  priority           Attention-cycle tier for Ctrl+E (1 = highest .. 3 = lowest; 0 clears)")
+		fmt.Println("  priority           Attention-cycle rank for Ctrl+E — strict rank, 1 = highest, unique per session (0 clears)")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()

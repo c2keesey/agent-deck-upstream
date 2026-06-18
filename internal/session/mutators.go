@@ -34,7 +34,7 @@ const (
 	FieldAutoMode           = "auto-mode"
 	FieldAccount            = "account"      // #924 per-session named account slot
 	FieldIdleTimeout        = "idle-timeout" // #1143 auto-stop dormant sessions
-	FieldPriority           = "priority"     // local fork: Ctrl+E attention cycle tier
+	FieldPriority           = "priority"     // local fork: Ctrl+E attention cycle strict rank (1 = highest)
 	FieldPin                = "pin"          // pin-sessions: anchor top/bottom of group
 	// FieldModel persists the operator's selected per-session model (#1436,
 	// follow-up to #1431). Tool-agnostic: routes to each tool's existing model
@@ -393,7 +393,7 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		}
 
 	case FieldPriority:
-		// Local fork: conductor-assigned importance tier (0 clears, 1..3).
+		// Local fork: conductor-assigned strict rank (0 clears; 1 = highest, unique per session).
 		// Live — the next Ctrl+E snapshot and status nudge read the new value.
 		oldValue = strconv.Itoa(inst.Priority)
 		prio, perr := ParsePriorityFlag(strings.TrimSpace(value))

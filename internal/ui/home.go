@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1878,9 +1879,10 @@ func attentionReadySince(inst *session.Instance) time.Time {
 
 // attentionSortedSessions returns the sessions that are READY to be picked back
 // up — status waiting (blocked on the user) or idle (finished its turn) — sorted
-// by conductor-assigned priority (1 highest .. 3; unset/0 last), then by
-// longest-waiting first. running sessions are excluded: there's nothing for the
-// user to do on them yet. This is the order Ctrl+E cycles through. (local fork)
+// by conductor-assigned priority (a strict rank, 1 = highest, unique per session;
+// unset/0 last), then by longest-waiting first. running sessions are excluded:
+// there's nothing for the user to do on them yet. This is the order Ctrl+E cycles
+// through. (local fork)
 func (h *Home) attentionSortedSessions() []*session.Instance {
 	h.instancesMu.RLock()
 	all := make([]*session.Instance, len(h.instances))
@@ -1897,10 +1899,11 @@ func (h *Home) attentionSortedSessions() []*session.Instance {
 		}
 	}
 
-	// Rank key for priority: 1..3 keep their value; unset (0) sorts last.
+	// Rank key for priority: any real rank keeps its value; unset (0) sorts
+	// last via a true maximum so any positive rank always sorts ahead of it.
 	rank := func(p int) int {
 		if p <= 0 {
-			return session.MaxPriority + 1
+			return math.MaxInt
 		}
 		return p
 	}
@@ -1921,10 +1924,10 @@ func (h *Home) attentionSortedSessions() []*session.Instance {
 }
 
 // attentionPriorityRank maps a priority to a sortable rank where lower is more
-// important and unset (0) sorts last. (local fork)
+// important and unset (0) sorts last (via a true maximum). (local fork)
 func attentionPriorityRank(p int) int {
 	if p <= 0 {
-		return session.MaxPriority + 1
+		return math.MaxInt
 	}
 	return p
 }
@@ -1970,22 +1973,25 @@ func (h *Home) attentionNudgeText(attachedID string, instances []*session.Instan
 
 // styledNudgeBar wraps the plain attention nudge in tmux status-left format
 // codes so the higher-priority-ready alert reads as a bold, filled, color-tiered
-// bar instead of blending into the surrounding notification text. The tiers
-// mirror the dashboard priority chip — P1 red, P2 orange, P3 yellow — and the
-// trailing #[default] resets styling so the appended FormatBar text is
-// unaffected. Empty in → empty out. (local fork)
+// bar instead of blending into the surrounding notification text. Priority is a
+// strict rank (1 = highest, unbounded), but the DISPLAY color buckets it to
+// mirror the dashboard priority chip — rank 1 red, rank 2 orange, rank ≥3 yellow.
+// The true rank stays in the "P<n>" text the nudge already carries. The trailing
+// #[default] resets styling so the appended FormatBar text is unaffected.
+// Empty in → empty out. (local fork)
 func styledNudgeBar(plain string) string {
 	if plain == "" {
 		return ""
 	}
-	// Tier color keyed off the "P<n>" the plain text already carries. Default
-	// to the P3 tier for any unexpected shape so the alert still stands out.
-	style := "#[fg=#1a1b26,bg=#e0af68,bold]" // P3: dark on yellow
+	// Color keyed off the "P<n>" the plain text carries. Rank ≥3 (and any
+	// unexpected shape) falls through to the yellow bucket so the alert stands
+	// out without needing a distinct color per unbounded rank.
+	style := "#[fg=#1a1b26,bg=#e0af68,bold]" // rank ≥3: dark on yellow
 	switch {
 	case strings.Contains(plain, " P1 "):
-		style = "#[fg=#ffffff,bg=#f7768e,bold]" // P1: white on red
+		style = "#[fg=#ffffff,bg=#f7768e,bold]" // rank 1: white on red
 	case strings.Contains(plain, " P2 "):
-		style = "#[fg=#1a1b26,bg=#ff9e64,bold]" // P2: dark on orange
+		style = "#[fg=#1a1b26,bg=#ff9e64,bold]" // rank 2: dark on orange
 	}
 	return style + " " + plain + " #[default]"
 }
@@ -15136,11 +15142,12 @@ func (h *Home) renderCreatingSessionItem(
 }
 
 // priorityBadge renders the conductor-assigned attention priority as a filled,
-// color-tiered chip — P1 red, P2 orange, P3 yellow — so the dashboard surfaces
-// at a glance which ready threads the Ctrl+E switcher will jump to first.
-// Returns "" for unset (0) so unprioritized rows stay clean. On the selected
-// row it reuses the selection-bar style so the chip stays legible inside the
-// highlight. (local fork)
+// chip showing the true strict rank (1 = highest, unbounded). The chip's
+// DISPLAY color buckets the rank — rank 1 red, rank 2 orange, rank ≥3 yellow —
+// so the dashboard surfaces at a glance which ready threads the Ctrl+E switcher
+// will jump to first, while the chip text keeps the exact "P<n>". Returns "" for
+// unset (0) so unprioritized rows stay clean. On the selected row it reuses the
+// selection-bar style so the chip stays legible inside the highlight. (local fork)
 func priorityBadge(prio int, selected bool) string {
 	if prio <= 0 {
 		return ""
@@ -15155,7 +15162,7 @@ func priorityBadge(prio int, selected bool) string {
 	case 2:
 		bg = ColorOrange
 	default:
-		bg = ColorYellow
+		bg = ColorYellow // rank ≥3
 	}
 	chip := lipgloss.NewStyle().Foreground(ColorBg).Background(bg).Bold(true)
 	return " " + chip.Render(fmt.Sprintf(" P%d ", prio))
@@ -15500,6 +15507,25 @@ func (h *Home) renderSessionItem(
 	// doesn't disturb name alignment).
 	priorityChip := priorityBadge(inst.Priority, selected)
 
+	// Top-priority marker (local fork): the single strict-rank-1 session gets a
+	// ◆ glyph in the otherwise-blank left gutter so the one next thing to pick
+	// up stands out at a glance. "◆ " is exactly leftGutterWidth (2) cells, so
+	// it drops into the reserved gutter without shifting any downstream column;
+	// every other row keeps the plain-space gutter. It deliberately lives in the
+	// gutter, NOT the selectionPrefix slot, so it coexists with the ▶ selection
+	// cursor — a row can be both selected (▶, after the indent) and rank-1 (◆,
+	// at the far-left edge) and both read clearly. Distinct glyph (◆ vs ▶) keeps
+	// the two meanings unambiguous. Selected rows reuse the selection-bar style
+	// so the marker stays legible inside the highlight.
+	leftGutter := strings.Repeat(" ", leftGutterWidth)
+	if inst.Priority == 1 {
+		markerStyle := lipgloss.NewStyle().Foreground(ColorRed).Bold(true)
+		if selected {
+			markerStyle = SessionStatusSelStyle
+		}
+		leftGutter = markerStyle.Render("◆") + " "
+	}
+
 	// Build row: [gutter][baseIndent][selection][tree][chevron][status] [primary] [P chip] [tool] [maestro] [badges] · [trailer]
 	// Personal-fork layout: one dynamically-chosen identity label, then the
 	// color-coded worktree chip, then the live activity trailer. The primary
@@ -15510,7 +15536,7 @@ func (h *Home) renderSessionItem(
 	// badge slot for it.
 	row := fmt.Sprintf(
 		"%s%s%s%s%s%s%s%s%s%s%s%s%s",
-		strings.Repeat(" ", leftGutterWidth),
+		leftGutter,
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),

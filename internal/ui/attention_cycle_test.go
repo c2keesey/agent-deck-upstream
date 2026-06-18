@@ -130,6 +130,33 @@ func TestAttentionSortedSessions_PriorityOrderAndReadyFilter(t *testing.T) {
 	}
 }
 
+// TestAttentionSortedSessions_HighRankOrdering pins the strict-rank behavior:
+// a rank past the old 1..3 cap (here 7) must sort BEHIND a smaller rank (P2)
+// and AHEAD of an unset (0) session. (local fork)
+func TestAttentionSortedSessions_HighRankOrdering(t *testing.T) {
+	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
+	h := &Home{}
+	h.instances = []*session.Instance{
+		readyInstance("unset", session.StatusWaiting, 0, base),
+		readyInstance("p7", session.StatusWaiting, 7, base),
+		readyInstance("p2", session.StatusWaiting, 2, base),
+	}
+	got := h.attentionSortedSessions()
+	gotIDs := make([]string, len(got))
+	for i, inst := range got {
+		gotIDs[i] = inst.ID
+	}
+	want := []string{"p2", "p7", "unset"}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("attentionSortedSessions returned %v, want %v", gotIDs, want)
+	}
+	for i := range want {
+		if gotIDs[i] != want[i] {
+			t.Fatalf("strict-rank order = %v, want %v (P2 < P7 < unset)", gotIDs, want)
+		}
+	}
+}
+
 func TestAttentionSortedSessions_LongestWaitingTiebreak(t *testing.T) {
 	base := time.Date(2026, 6, 12, 9, 0, 0, 0, time.UTC)
 	h := &Home{}
@@ -229,9 +256,10 @@ func TestStyledNudgeBar_TierColorsAndReset(t *testing.T) {
 		plain  string
 		wantBg string
 	}{
-		{"⚡ P1 urgent ready — ^E", "bg=#f7768e"}, // red
-		{"⚡ P2 soon ready — ^E", "bg=#ff9e64"},   // orange
-		{"⚡ P3 later ready — ^E", "bg=#e0af68"},  // yellow
+		{"⚡ P1 urgent ready — ^E", "bg=#f7768e"}, // rank 1: red
+		{"⚡ P2 soon ready — ^E", "bg=#ff9e64"},   // rank 2: orange
+		{"⚡ P3 later ready — ^E", "bg=#e0af68"},  // rank ≥3: yellow
+		{"⚡ P7 later ready — ^E", "bg=#e0af68"},  // rank ≥3 buckets to yellow
 	}
 	for _, tc := range cases {
 		got := styledNudgeBar(tc.plain)
@@ -257,13 +285,13 @@ func TestPriorityBadge_UnsetIsEmpty(t *testing.T) {
 }
 
 func TestPriorityBadge_RendersTier(t *testing.T) {
-	for _, prio := range []int{1, 2, 3} {
+	for _, prio := range []int{1, 2, 3, 7} {
 		got := priorityBadge(prio, false)
 		if got == "" {
 			t.Fatalf("priority %d should render a badge", prio)
 		}
 		if !strings.Contains(got, fmt.Sprintf("P%d", prio)) {
-			t.Errorf("priorityBadge(%d) = %q, want it to contain P%d", prio, got, prio)
+			t.Errorf("priorityBadge(%d) = %q, want it to contain P%d (true rank, not bucketed)", prio, got, prio)
 		}
 	}
 }

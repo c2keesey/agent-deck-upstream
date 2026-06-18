@@ -1,5 +1,6 @@
 // Priority field (local fork): conductor-assigned session priority that
-// drives the Ctrl+E attention cycle. 0 = unset, 1 (highest) .. 3 (lowest).
+// drives the Ctrl+E attention cycle. A strict rank — 1 = highest, unique per
+// session, no upper bound; 0 = unset.
 //
 // Persistence mirrors the #1143 idle-timeout pattern: the value rides in the
 // tool_data extras zone so legacy binaries round-trip it untouched.
@@ -126,15 +127,53 @@ func TestPriority_SetField(t *testing.T) {
 		t.Fatalf("Priority after clear = %d, want 0", inst.Priority)
 	}
 
-	// Out-of-range and junk rejected.
-	for _, bad := range []string{"4", "-1", "high", "1.5"} {
+	// Negatives and junk rejected; the rank is now unbounded above (no max cap).
+	for _, bad := range []string{"-1", "high", "1.5"} {
 		if _, _, err := SetField(inst, FieldPriority, bad, nil); err == nil {
 			t.Fatalf("SetField(priority, %q) should fail", bad)
 		}
 	}
 
+	// Ranks beyond the old 1..3 cap are now valid (strict rank, no upper bound).
+	if _, _, err := SetField(inst, FieldPriority, "7", nil); err != nil {
+		t.Fatalf("SetField(priority, 7) should succeed under strict-rank: %v", err)
+	}
+	if inst.Priority != 7 {
+		t.Fatalf("Priority = %d after set 7, want 7", inst.Priority)
+	}
+
 	// Live field — no restart required.
 	if RestartPolicyFor(FieldPriority) != FieldLive {
 		t.Fatalf("priority should be a live field")
+	}
+}
+
+// TestPriority_HighRankRoundTrip proves a rank past the old 1..3 cap survives
+// the set → persist → read path. (local fork: strict rank, no upper bound)
+func TestPriority_HighRankRoundTrip(t *testing.T) {
+	if n, err := ParsePriorityFlag("7"); err != nil || n != 7 {
+		t.Fatalf("ParsePriorityFlag(7) = (%d, %v), want (7, nil)", n, err)
+	}
+
+	td := WritePriorityToToolData(nil, 7)
+	if got := ReadPriorityFromToolData(td); got != 7 {
+		t.Fatalf("priority 7 did not round-trip through tool_data: got %d", got)
+	}
+
+	t.Setenv("HOME", t.TempDir())
+	storage := newTestStorage(t)
+	inst := NewInstance("priority-7", "/tmp")
+	inst.Tool = "shell"
+	inst.Priority = 7
+	groupTree := NewGroupTreeWithGroups([]*Instance{inst}, nil)
+	if err := storage.SaveWithGroups([]*Instance{inst}, groupTree); err != nil {
+		t.Fatalf("SaveWithGroups: %v", err)
+	}
+	loaded, _, err := storage.LoadWithGroups()
+	if err != nil {
+		t.Fatalf("LoadWithGroups: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].Priority != 7 {
+		t.Fatalf("priority 7 not preserved across SQLite round-trip: %+v", loaded)
 	}
 }

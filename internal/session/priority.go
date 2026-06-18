@@ -1,5 +1,7 @@
 // Priority field (local fork): conductor-assigned session priority driving
-// the Ctrl+E attention cycle. 0 = unset, 1 (highest) .. 3 (lowest).
+// the Ctrl+E attention cycle. A strict rank — 1 = highest, unique per session,
+// no upper bound. 0 = unset (sorts last). Ranks express a strict total order,
+// not capped buckets.
 //
 // Persistence mirrors the #1143 idle-timeout pattern: the value rides in the
 // tool_data extras zone, so the positional MarshalToolData signature stays
@@ -13,9 +15,6 @@ import (
 )
 
 const toolDataPriorityKey = "priority"
-
-// MaxPriority is the lowest (numerically highest) settable priority tier.
-const MaxPriority = 3
 
 // WritePriorityToToolData merges priority into the given tool_data JSON blob.
 // Passing prio == 0 removes the key, keeping the blob identical to a
@@ -49,14 +48,15 @@ func ReadPriorityFromToolData(td json.RawMessage) int {
 }
 
 // ParsePriorityFlag parses a priority value from CLI/TUI input.
-// Accepts "" / "0" (clear) and "1".."3"; everything else errors.
+// Accepts "" / "0" (clear) and any positive integer rank (1 = highest, unique
+// per session, no upper bound); negatives and junk error.
 func ParsePriorityFlag(value string) (int, error) {
 	if value == "" {
 		return 0, nil
 	}
 	n, err := strconv.Atoi(value)
-	if err != nil || n < 0 || n > MaxPriority {
-		return 0, fmt.Errorf("invalid priority %q — expected 0 (clear) or 1..%d (1 = highest)", value, MaxPriority)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid priority %q — expected 0 (clear) or a strict rank ≥ 1 (1 = highest, unique per session)", value)
 	}
 	return n, nil
 }

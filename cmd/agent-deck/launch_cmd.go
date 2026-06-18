@@ -102,8 +102,8 @@ func handleLaunch(profile string, args []string) {
 	// Issue #1143: auto-stop dormant child sessions.
 	idleTimeout := fs.String("idle-timeout", "", "Auto-stop session after this duration of no tmux output (Go duration: 30m, 1h, 24h). 0 or unset = disabled")
 
-	// Local fork: conductor-assigned priority tier for the Ctrl+E attention cycle.
-	priority := fs.String("priority", "", "Attention-cycle priority tier (1 = highest .. 3 = lowest; 0 or unset = none)")
+	// Local fork: conductor-assigned priority rank for the Ctrl+E attention cycle.
+	priority := fs.String("priority", "", "Attention-cycle priority — strict rank, 1 = highest, unique per session (0 or unset = none)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck launch [path] [options]")

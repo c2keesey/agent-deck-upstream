@@ -146,7 +146,7 @@ type InstanceData struct {
 	// IdleTimeoutSecs mirrors Instance.IdleTimeoutSecs (#1143). 0 = disabled.
 	IdleTimeoutSecs int64 `json:"idle_timeout_secs,omitempty"`
 
-	// Priority mirrors Instance.Priority (local fork). 0 = unset, 1..3.
+	// Priority mirrors Instance.Priority (local fork). 0 = unset; strict rank, 1 = highest, unbounded.
 	Priority int `json:"priority,omitempty"`
 }
 

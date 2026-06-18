@@ -2427,23 +2427,43 @@ func (h *Home) syncViewport() {
 // All notification sync is now handled by syncNotificationsBackground() which runs
 // every 2s in the background worker, including during tea.Exec pauses.
 
+// attachedSessionsOnSockets is the seam for tmux's attached-session detection.
+// Production points at the socket-aware union query so a session attached on an
+// isolated agent-deck socket (TmuxSocketName != "") is still found. The old
+// default-socket-only query silently missed those, which broke the priority
+// nudge: the conductor (and most fork sessions) live on isolated sockets, so
+// getAttachedSessionID resolved to "" in steady state and attentionNudgeText
+// bailed at its attachedID == "" guard even though the Ctrl+E jump — which
+// doesn't depend on attach detection — worked fine. Tests override this to
+// stand in for a live tmux server. (local fork)
+var attachedSessionsOnSockets = tmux.GetAttachedSessionsOnSockets
+
 // getAttachedSessionID returns the instance ID of the currently attached agentdeck session.
 // This detects which session the user is viewing, even if they switched via tmux directly.
 func (h *Home) getAttachedSessionID() string {
-	attachedSessions, err := tmux.GetAttachedSessions()
-	if err != nil || len(attachedSessions) == 0 {
-		return ""
-	}
-
+	// Build the name->ID map and the set of in-use sockets under one lock, then
+	// query attach state outside the lock (the query spawns tmux subprocesses).
+	// Mirrors reconcileLivePipes: an attached session on an isolated socket is
+	// invisible to a default-socket-only query, so every socket must be probed.
 	h.instancesMu.RLock()
-	defer h.instancesMu.RUnlock()
+	idByName := make(map[string]string, len(h.instances))
+	sockets := make([]string, 0, len(h.instances))
+	seenSocket := make(map[string]bool, len(h.instances))
+	for _, inst := range h.instances {
+		if ts := inst.GetTmuxSession(); ts != nil {
+			idByName[ts.Name] = inst.ID
+		}
+		if !seenSocket[inst.TmuxSocketName] {
+			seenSocket[inst.TmuxSocketName] = true
+			sockets = append(sockets, inst.TmuxSocketName)
+		}
+	}
+	h.instancesMu.RUnlock()
 
-	// Find the first attached agentdeck session
-	for _, sessName := range attachedSessions {
-		for _, inst := range h.instances {
-			if ts := inst.GetTmuxSession(); ts != nil && ts.Name == sessName {
-				return inst.ID
-			}
+	// Find the first attached agentdeck session across every in-use socket.
+	for _, sessName := range attachedSessionsOnSockets(sockets...) {
+		if id, ok := idByName[sessName]; ok {
+			return id
 		}
 	}
 	return ""

@@ -4229,7 +4229,18 @@ func (h *Home) syncNotificationsBackground() {
 		}
 	}()
 
-	if !h.manageTmuxNotifications || !h.notificationsEnabled || h.notificationManager == nil {
+	if !h.manageTmuxNotifications {
+		return
+	}
+
+	// Local fork: the ⚡ priority nudge is a separate feature from the optional
+	// upstream notification slot bar. When the slot bar is disabled
+	// (notifications.enabled=false → notificationManager nil) we still own the
+	// status line via inject_status_line, so render the nudge on its own instead
+	// of bailing out with the whole slot-bar machinery. Without this the nudge
+	// was silently gated off whenever a user turned the noisy [1]..[6] bar off.
+	if !h.notificationsEnabled || h.notificationManager == nil {
+		h.syncPriorityNudgeOnly()
 		return
 	}
 
@@ -4331,6 +4342,47 @@ func (h *Home) syncNotificationsBackground() {
 	// This fixes the bug where key bindings became stale when TUI was paused (tea.Exec).
 	// updateKeyBindings() is thread-safe via boundKeysMu.
 	h.updateKeyBindings()
+}
+
+// statusLeftWriter is the seam for writing the shared global tmux status-left.
+// Empty text restores the user's captured original (theme/plugin). Production
+// uses tmux; tests override it to capture the rendered bar without a live tmux
+// server. (local fork)
+var statusLeftWriter = func(text string) {
+	if text == "" {
+		_ = tmux.ClearStatusLeftGlobal()
+	} else {
+		_ = tmux.SetStatusLeftGlobal(text)
+	}
+	_ = tmux.RefreshStatusBarImmediate()
+}
+
+// syncPriorityNudgeOnly renders just the ⚡ priority nudge to the shared tmux
+// status-left. It runs when agent-deck owns the status line
+// (manageTmuxNotifications) but the notification slot bar is disabled
+// (notificationManager nil), so the nudge no longer depends on the slot bar
+// being on. Mirrors the bar-write block in syncNotificationsBackground:
+// change-detect against lastBarText and restore the original on empty so the
+// user's tmux theme is preserved when nothing is ready. (local fork)
+func (h *Home) syncPriorityNudgeOnly() {
+	currentSessionID := h.getAttachedSessionID()
+
+	h.instancesMu.RLock()
+	instances := make([]*session.Instance, len(h.instances))
+	copy(instances, h.instances)
+	h.instancesMu.RUnlock()
+
+	barText := styledNudgeBar(h.attentionNudgeText(currentSessionID, instances))
+
+	h.lastBarTextMu.Lock()
+	if barText == h.lastBarText {
+		h.lastBarTextMu.Unlock()
+		return
+	}
+	h.lastBarText = barText
+	h.lastBarTextMu.Unlock()
+
+	statusLeftWriter(barText)
 }
 
 // updateKeyBindings updates tmux key bindings based on current notification entries.

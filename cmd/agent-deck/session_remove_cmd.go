@@ -15,6 +15,13 @@ import (
 // --prune-worktree additionally kills the tmux process and removes any git
 // worktree associated with the session (registry-only by default).
 //
+// --keep-tmux (disown) deletes ONLY the registry row and leaves the tmux
+// session + its process tree running. This is the safe way to release a
+// session that was wrongly adopted (e.g. a cross-profile "recovered" entry)
+// without ending the live work it points at. It implies neither the kill nor
+// the worktree prune, and bypasses the stopped/error gate (nothing is killed,
+// so removing a running entry is safe).
+//
 // Claude transcripts under ~/.claude/projects/<slug>/ are never touched.
 func handleSessionRemove(profile string, args []string) {
 	fs := flag.NewFlagSet("session remove", flag.ExitOnError)
@@ -24,6 +31,7 @@ func handleSessionRemove(profile string, args []string) {
 	force := fs.Bool("force", false, "Remove even when the session is running/waiting/idle (destructive)")
 	allErrored := fs.Bool("all-errored", false, "Remove every session currently in the 'error' state (bulk)")
 	pruneWorktree := fs.Bool("prune-worktree", false, "Also kill the process and remove any git worktree (destructive)")
+	keepTmux := fs.Bool("keep-tmux", false, "Disown: delete the registry row only, leave the tmux session + process running (never kills)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session remove <id|title> [options]")
@@ -74,7 +82,9 @@ func handleSessionRemove(profile string, args []string) {
 		return
 	}
 
-	if !*force && !isRemovableStatus(inst.Status) {
+	// --keep-tmux (disown) never kills, so removing a running entry is safe and
+	// the stopped/error gate doesn't apply.
+	if !*force && !*keepTmux && !isRemovableStatus(inst.Status) {
 		out.Error(
 			fmt.Sprintf(
 				"session '%s' is in state '%s'; only stopped/error sessions may be removed without --force",
@@ -85,19 +95,24 @@ func handleSessionRemove(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Always kill the tmux scope + its process tree before deleting the
-	// registry row (issue #59, v1.7.68). Previously Kill() was only
-	// called inside pruneSessionWorktree, so `session remove --force`
-	// on a running session left the claude child running as an orphan
-	// — observed on the maintainer's host as a 33-hour orphan claude
-	// process with a since-deleted AGENTDECK_INSTANCE_ID.
-	//
-	// KillAndWait runs the SIGTERM→SIGKILL escalation synchronously so
-	// the kill completes before this short-lived CLI exits.
-	_ = inst.KillAndWait()
+	if *keepTmux {
+		// Disown: registry-only delete, tmux + process left running. (Skips kill
+		// AND prune — both would end the session this flag exists to preserve.)
+	} else {
+		// Always kill the tmux scope + its process tree before deleting the
+		// registry row (issue #59, v1.7.68). Previously Kill() was only
+		// called inside pruneSessionWorktree, so `session remove --force`
+		// on a running session left the claude child running as an orphan
+		// — observed on the maintainer's host as a 33-hour orphan claude
+		// process with a since-deleted AGENTDECK_INSTANCE_ID.
+		//
+		// KillAndWait runs the SIGTERM→SIGKILL escalation synchronously so
+		// the kill completes before this short-lived CLI exits.
+		_ = inst.KillAndWait()
 
-	if *pruneWorktree {
-		pruneSessionWorktree(inst)
+		if *pruneWorktree {
+			pruneSessionWorktree(inst)
+		}
 	}
 
 	// v1.9.1 (#909): RemoveSessionAndVerify replaces the
@@ -117,10 +132,15 @@ func handleSessionRemove(profile string, args []string) {
 	_, _ = session.SweepInboxesForChildSession(inst.ID)
 	_, _ = session.RemoveNotifyStateRecord(inst.ID)
 
-	out.Success(fmt.Sprintf("Removed session: %s", inst.Title), map[string]interface{}{
-		"success": true,
-		"id":      inst.ID,
-		"title":   inst.Title,
+	verb := "Removed session"
+	if *keepTmux {
+		verb = "Disowned session (tmux left running)"
+	}
+	out.Success(fmt.Sprintf("%s: %s", verb, inst.Title), map[string]interface{}{
+		"success":   true,
+		"id":        inst.ID,
+		"title":     inst.Title,
+		"keep_tmux": *keepTmux,
 	})
 }
 

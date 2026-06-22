@@ -7,8 +7,17 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
-// DiscoverExistingTmuxSessions finds all tmux sessions and converts them to instances
-func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, error) {
+// DiscoverExistingTmuxSessions finds all tmux sessions and converts them to instances.
+//
+// currentProfile is the profile the caller is operating under (the one discovered
+// orphans would be adopted INTO). agent-deck stamps each session's owning profile into
+// the tmux environment (AGENTDECK_PROFILE, set by ensureProfileEnv at spawn), so an
+// orphaned agentdeck_ session whose AGENTDECK_PROFILE names a DIFFERENT profile is skipped
+// — never cross-adopted. Without this guard, discovery is profile-blind: a single tmux
+// server is shared machine-wide, so importing under one profile would pull every OTHER
+// profile's live sessions into a "recovered" group. Pass "" to disable the guard (legacy
+// behaviour: adopt every orphan regardless of owner).
+func DiscoverExistingTmuxSessions(existingInstances []*Instance, currentProfile string) ([]*Instance, error) {
 	// Get all tmux sessions
 	tmuxSessions, err := tmux.DiscoverAllTmuxSessions()
 	if err != nil {
@@ -38,6 +47,17 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 		groupPath := ""
 		isOrphaned := false
 		if strings.HasPrefix(sess.Name, tmux.SessionPrefix) {
+			// Cross-profile guard: never adopt a session owned by a DIFFERENT profile.
+			// The owner is stamped into the tmux env at spawn (AGENTDECK_PROFILE). A
+			// non-empty owner that doesn't match currentProfile means this orphan belongs
+			// to another profile — skip it entirely (do not recover into this profile).
+			// Empty / unreadable owner => genuinely unowned, fall through and adopt.
+			if currentProfile != "" {
+				if owner, envErr := sess.GetEnvironment("AGENTDECK_PROFILE"); envErr == nil && owner != "" && owner != currentProfile {
+					continue
+				}
+			}
+
 			isOrphaned = true
 			// Extract title from session name: agentdeck_<title>_<8-char-hash>
 			namePart := strings.TrimPrefix(sess.Name, tmux.SessionPrefix)

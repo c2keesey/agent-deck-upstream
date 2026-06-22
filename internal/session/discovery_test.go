@@ -10,8 +10,8 @@ func TestDiscoverExistingTmuxSessions(t *testing.T) {
 		t.Skip("tmux not available")
 	}
 
-	// Should not error even with no existing instances
-	discovered, err := DiscoverExistingTmuxSessions([]*Instance{})
+	// Should not error even with no existing instances ("" = no profile guard, legacy behaviour)
+	discovered, err := DiscoverExistingTmuxSessions([]*Instance{}, "")
 	if err != nil {
 		t.Logf("DiscoverExistingTmuxSessions error (may be expected): %v", err)
 	}
@@ -32,7 +32,7 @@ func TestDiscoverSkipsAgentDeckSessions(t *testing.T) {
 		},
 	}
 
-	discovered, err := DiscoverExistingTmuxSessions(existing)
+	discovered, err := DiscoverExistingTmuxSessions(existing, "")
 	if err != nil {
 		t.Logf("Error (may be expected): %v", err)
 	}
@@ -42,6 +42,51 @@ func TestDiscoverSkipsAgentDeckSessions(t *testing.T) {
 		if d.Title == "existing-session" {
 			t.Error("Should not discover already tracked sessions")
 		}
+	}
+}
+
+// TestDiscoverSkipsCrossProfileSessions verifies the profile-blindness fix: discovery
+// running under one profile must NOT adopt agentdeck_ sessions owned by a DIFFERENT
+// profile (their owner is stamped in the tmux env as AGENTDECK_PROFILE). A same-profile
+// session IS still adopted. Regression test for the cross-profile "recovered" adoption bug.
+func TestDiscoverSkipsCrossProfileSessions(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+
+	// Two orphan agent-deck sessions on the default tmux server, stamped with different owners.
+	mine := "agentdeck_xprofiletest-mine_aaaa1111"     // owner = "default" (the profile we discover under)
+	theirs := "agentdeck_xprofiletest-theirs_bbbb2222" // owner = "personal" (a different profile)
+	for name, owner := range map[string]string{mine: "default", theirs: "personal"} {
+		_ = exec.Command("tmux", "kill-session", "-t", name).Run() // ensure clean
+		if err := exec.Command("tmux", "new-session", "-d", "-s", name).Run(); err != nil {
+			t.Skipf("cannot create tmux session %s: %v", name, err)
+		}
+		defer func(n string) { _ = exec.Command("tmux", "kill-session", "-t", n).Run() }(name)
+		if err := exec.Command("tmux", "set-environment", "-t", name, "AGENTDECK_PROFILE", owner).Run(); err != nil {
+			t.Fatalf("set-environment on %s: %v", name, err)
+		}
+	}
+
+	discovered, err := DiscoverExistingTmuxSessions([]*Instance{}, "default")
+	if err != nil {
+		t.Logf("discovery error (may be expected on busy server): %v", err)
+	}
+
+	var sawMine, sawTheirs bool
+	for _, d := range discovered {
+		switch d.Title {
+		case "xprofiletest-mine":
+			sawMine = true
+		case "xprofiletest-theirs":
+			sawTheirs = true
+		}
+	}
+	if sawTheirs {
+		t.Error("CROSS-PROFILE ADOPTION: a session owned by profile 'personal' was adopted while discovering under 'default'")
+	}
+	if !sawMine {
+		t.Error("a same-profile ('default') orphan should have been discovered but was not")
 	}
 }
 

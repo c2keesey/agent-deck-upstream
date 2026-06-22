@@ -2091,15 +2091,22 @@ func handleRemove(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
+	keepTmux := fs.Bool("keep-tmux", false, "Disown: delete the registry row only, leave the tmux session + process running (never kills)")
 
 	fs.Usage = func() {
-		fmt.Println("Usage: agent-deck remove <id|title>")
+		fmt.Println("Usage: agent-deck remove <id|title> [--keep-tmux]")
 		fmt.Println()
-		fmt.Println("Remove a session by ID or title.")
+		fmt.Println("Remove a session by ID or title. By default this kills the tmux")
+		fmt.Println("session + process tree, then deletes the registry row.")
+		fmt.Println()
+		fmt.Println("--keep-tmux (disown) deletes ONLY the registry row and leaves the")
+		fmt.Println("tmux session running — the safe way to release a wrongly-adopted")
+		fmt.Println("session (e.g. a cross-profile 'recovered' entry) without ending it.")
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  agent-deck remove abc12345")
 		fmt.Println("  agent-deck remove \"My Project\"")
+		fmt.Println("  agent-deck remove abc12345 --keep-tmux   # disown, leave tmux running")
 		fmt.Println("  agent-deck -p work remove abc12345   # Remove from 'work' profile")
 	}
 
@@ -2138,39 +2145,44 @@ func handleRemove(profile string, args []string) {
 	removedID := inst.ID
 	removedTitle := inst.Title
 
-	// Always attempt to kill the tmux session, even if Exists() returns false.
-	// The saved status may be stale (e.g., "error" in DB but tmux session still alive).
-	// KillAndWait is safe to call on non-existent sessions (returns error which we handle).
-	// Uses the synchronous variant so the SIGTERM→SIGKILL escalation finishes
-	// before this short-lived CLI exits — otherwise SIGHUP-immune claude
-	// processes survive as orphans (issue #59, v1.7.68).
-	if err := inst.KillAndWait(); err != nil {
-		// Only warn if the session actually existed (ignore "not found" errors)
-		if inst.Exists() && !*jsonOutput {
-			fmt.Printf("Warning: failed to kill tmux session: %v\n", err)
-			fmt.Println("Session removed from Agent Deck but may still be running in tmux")
-		}
-	}
-
-	// v1.7.21+: if this session was spawned via LaunchAs=service, the
-	// transient systemd-user service unit survives a plain `tmux
-	// kill-server` (Restart=on-failure would respawn it). Best-effort
-	// stop + reset-failed the unit here so `agent-deck remove` is truly
-	// terminal. No-op on non-service-mode sessions and on non-systemd
-	// hosts.
-	_ = inst.StopServiceUnit()
-
-	// Clean up worktree directory if this is a worktree session
-	if inst.IsWorktree() {
-		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
-			if err := backend.RemoveWorktree(inst.WorktreePath, false); err != nil {
-				if !*jsonOutput {
-					fmt.Printf("Warning: failed to remove worktree: %v\n", err)
-				}
+	// --keep-tmux (disown): skip ALL termination (kill, service-unit stop, worktree
+	// removal) and only delete the registry row below. This releases a wrongly-adopted
+	// session (e.g. a cross-profile "recovered" entry) without ending the live work.
+	if !*keepTmux {
+		// Always attempt to kill the tmux session, even if Exists() returns false.
+		// The saved status may be stale (e.g., "error" in DB but tmux session still alive).
+		// KillAndWait is safe to call on non-existent sessions (returns error which we handle).
+		// Uses the synchronous variant so the SIGTERM→SIGKILL escalation finishes
+		// before this short-lived CLI exits — otherwise SIGHUP-immune claude
+		// processes survive as orphans (issue #59, v1.7.68).
+		if err := inst.KillAndWait(); err != nil {
+			// Only warn if the session actually existed (ignore "not found" errors)
+			if inst.Exists() && !*jsonOutput {
+				fmt.Printf("Warning: failed to kill tmux session: %v\n", err)
+				fmt.Println("Session removed from Agent Deck but may still be running in tmux")
 			}
-			_ = backend.PruneWorktrees()
-		} else if !*jsonOutput {
-			fmt.Printf("Warning: failed to initialize VCS for worktree cleanup: %v\n", err)
+		}
+
+		// v1.7.21+: if this session was spawned via LaunchAs=service, the
+		// transient systemd-user service unit survives a plain `tmux
+		// kill-server` (Restart=on-failure would respawn it). Best-effort
+		// stop + reset-failed the unit here so `agent-deck remove` is truly
+		// terminal. No-op on non-service-mode sessions and on non-systemd
+		// hosts.
+		_ = inst.StopServiceUnit()
+
+		// Clean up worktree directory if this is a worktree session
+		if inst.IsWorktree() {
+			if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
+				if err := backend.RemoveWorktree(inst.WorktreePath, false); err != nil {
+					if !*jsonOutput {
+						fmt.Printf("Warning: failed to remove worktree: %v\n", err)
+					}
+				}
+				_ = backend.PruneWorktrees()
+			} else if !*jsonOutput {
+				fmt.Printf("Warning: failed to initialize VCS for worktree cleanup: %v\n", err)
+			}
 		}
 	}
 
@@ -2209,14 +2221,19 @@ func handleRemove(profile string, args []string) {
 		fmt.Fprintf(os.Stderr, "warn: notify-state sweep for %s failed: %v\n", removedID, err)
 	}
 
+	verb := "Removed session"
+	if *keepTmux {
+		verb = "Disowned session (tmux left running)"
+	}
 	out.Success(
-		fmt.Sprintf("Removed session: %s (from profile '%s')", removedTitle, storage.Profile()),
+		fmt.Sprintf("%s: %s (from profile '%s')", verb, removedTitle, storage.Profile()),
 		map[string]interface{}{
-			"success": true,
-			"id":      removedID,
-			"title":   removedTitle,
-			"removed": true,
-			"profile": storage.Profile(),
+			"success":   true,
+			"id":        removedID,
+			"title":     removedTitle,
+			"removed":   true,
+			"keep_tmux": *keepTmux,
+			"profile":   storage.Profile(),
 		},
 	)
 }

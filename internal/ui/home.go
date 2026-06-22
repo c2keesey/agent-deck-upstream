@@ -12519,7 +12519,9 @@ func (r remoteAttachCmd) SetStderr(writer io.Writer) {}
 
 // importSessions imports existing tmux sessions
 func (h *Home) importSessions() tea.Msg {
-	discovered, err := session.DiscoverExistingTmuxSessions(h.instances)
+	// Pass the active profile so discovery never cross-adopts sessions owned by another
+	// profile (recovery is otherwise profile-blind across the shared machine-wide tmux server).
+	discovered, err := session.DiscoverExistingTmuxSessions(h.instances, session.GetEffectiveProfile(""))
 	if err != nil {
 		return loadSessionsMsg{err: err}
 	}

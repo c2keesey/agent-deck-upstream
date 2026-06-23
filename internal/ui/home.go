@@ -10919,16 +10919,25 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		h.maiaWorkerPicker.Hide()
 		return h, nil
-	case "c", "tab":
+	case "tab":
 		// Toggle the active tool (Claude ⟷ Codex). The action keys below
-		// (Enter, r, ~) then create with whichever tool is active, so 'c'
-		// chains into any action instead of immediately creating.
+		// (Enter, c, r, ~) then create with whichever tool is active.
 		h.maiaWorkerPicker.ToggleTool()
 		return h, nil
 	case "enter":
 		// Create with the active tool in the highlighted worker.
 		tool := h.maiaWorkerPicker.ActiveTool()
 		selected, group := h.maiaWorkerPicker.Selected()
+		h.maiaWorkerPicker.Hide()
+		if selected == "" {
+			return h, nil
+		}
+		return h, h.createMaiaWorkerSession(selected, group, tool)
+	case "c":
+		// Conductor: create a session in the MAIA.conductor worktree directly
+		// with the active tool, bypassing the worker column.
+		tool := h.maiaWorkerPicker.ActiveTool()
+		selected, group := h.maiaWorkerPicker.ConductorSelected()
 		h.maiaWorkerPicker.Hide()
 		if selected == "" {
 			return h, nil

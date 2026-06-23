@@ -119,6 +119,32 @@ func TestMaiaWorkerPicker_Navigation(t *testing.T) {
 	}
 }
 
+func TestMaiaWorkerPicker_ConductorSelected(t *testing.T) {
+	// With a MAIA.conductor worktree present, 'c' targets it in the conductor group.
+	p := &MaiaWorkerPicker{conductors: []string{"/r/MAIA.conductor"}}
+	if path, group := p.ConductorSelected(); path != "/r/MAIA.conductor" || group != maiaConductorGroup {
+		t.Errorf("ConductorSelected = (%q, %q), want (MAIA.conductor, %q)", path, group, maiaConductorGroup)
+	}
+
+	// No conductor worktree -> empty (the 'c' hotkey then no-ops in the caller).
+	p.conductors = nil
+	if path, _ := p.ConductorSelected(); path != "" {
+		t.Errorf("ConductorSelected with no conductor = %q, want empty", path)
+	}
+}
+
+func TestMaiaWorkerPicker_ConductorHint(t *testing.T) {
+	p := &MaiaWorkerPicker{
+		visible: true,
+		workers: []string{"/r/MAIA.worker-1"},
+		width:   100,
+		height:  30,
+	}
+	if !strings.Contains(p.View(), "c conductor") {
+		t.Errorf("hint should advertise the conductor hotkey; got:\n%s", p.View())
+	}
+}
+
 func TestWorkerSortKey(t *testing.T) {
 	if a, b := workerSortKey("/r/MAIA.worker-2"), workerSortKey("/r/MAIA.worker-10"); a >= b {
 		t.Errorf("worker-2 (%d) should sort before worker-10 (%d)", a, b)

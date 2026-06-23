@@ -18,8 +18,9 @@ const maiaReposDir = "/Users/c2k/MAIA/Repos"
 // Groups the picker pins new sessions to, per the user's workflow:
 // workers land in maia/active, read-only dev sessions in maia/read-only-dev.
 const (
-	maiaWorkerGroup = "maia/active"
-	maiaRoDevGroup  = "maia/read-only-dev"
+	maiaWorkerGroup    = "maia/active"
+	maiaRoDevGroup     = "maia/read-only-dev"
+	maiaConductorGroup = "maia/conductor"
 )
 
 // MaiaWorkerPicker is the new-session picker for MAIA work. It shows a single
@@ -35,12 +36,14 @@ type MaiaWorkerPicker struct {
 	visible      bool
 	workers      []string        // worker worktree paths
 	roDevs       []string        // ro-dev worktree paths
+	conductors   []string        // MAIA.conductor worktree paths (personal fork)
 	occupied     map[string]bool // worktree path -> already hosts a session
 	workerCursor int
 	tool         string // active tool the action keys create with ("claude" | "codex")
-	width        int
-	height       int
-	scanErr      string
+
+	width   int
+	height  int
+	scanErr string
 }
 
 // NewMaiaWorkerPicker constructs an empty picker; worktrees are scanned on
@@ -80,6 +83,16 @@ func (m *MaiaWorkerPicker) ToggleTool() {
 	} else {
 		m.tool = maiaToolCodex
 	}
+}
+
+// ConductorSelected returns the MAIA.conductor worktree path and group, used by
+// the 'c' hotkey to create a session in the conductor worktree directly (no
+// column to browse). Empty path means no conductor worktree exists.
+func (m *MaiaWorkerPicker) ConductorSelected() (path, group string) {
+	if len(m.conductors) > 0 {
+		return m.conductors[0], maiaConductorGroup
+	}
+	return "", ""
 }
 
 // Hide closes the picker.
@@ -135,6 +148,7 @@ func (m *MaiaWorkerPicker) Update(msg tea.KeyMsg) (*MaiaWorkerPicker, tea.Cmd) {
 func (m *MaiaWorkerPicker) refreshWorktrees() {
 	m.workers = nil
 	m.roDevs = nil
+	m.conductors = nil
 	m.scanErr = ""
 	entries, err := os.ReadDir(maiaReposDir)
 	if err != nil {
@@ -152,6 +166,8 @@ func (m *MaiaWorkerPicker) refreshWorktrees() {
 			m.workers = append(m.workers, path)
 		case name == "MAIA.ro-dev" || strings.HasPrefix(name, "MAIA.ro-dev"):
 			m.roDevs = append(m.roDevs, path)
+		case name == "MAIA.conductor":
+			m.conductors = append(m.conductors, path)
 		}
 	}
 	sort.SliceStable(m.workers, func(i, j int) bool {
@@ -202,8 +218,8 @@ func (m *MaiaWorkerPicker) View() string {
 		body = m.renderColumn("Workers", m.workers, m.workerCursor, true, true)
 	}
 
-	hint := lipgloss.NewStyle().Foreground(ColorComment).
-		Render("↑/↓ pick · c/Tab tool · Enter worker · r ro-dev · s shell · ~ home · Esc")
+	hintText := "↑/↓ pick · Tab tool · Enter worker · c conductor · r ro-dev · s shell · ~ home · Esc"
+	hint := lipgloss.NewStyle().Foreground(ColorComment).Render(hintText)
 
 	content := lipgloss.JoinVertical(lipgloss.Left, title, "", toolBar, "", body, "", hint)
 	dialog := DialogBoxStyle.Render(content)

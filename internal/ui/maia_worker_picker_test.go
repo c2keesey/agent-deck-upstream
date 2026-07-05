@@ -145,6 +145,56 @@ func TestMaiaWorkerPicker_ConductorHint(t *testing.T) {
 	}
 }
 
+func TestResolveRemoteLane(t *testing.T) {
+	// MAIA_REMOTE_LANE wins when set.
+	if got := resolveRemoteLane("ck", "chris"); got != "ck" {
+		t.Errorf("resolveRemoteLane(ck, chris) = %q, want ck", got)
+	}
+	// Falls back to $USER when the lane env is empty.
+	if got := resolveRemoteLane("", "chris"); got != "chris" {
+		t.Errorf("resolveRemoteLane(\"\", chris) = %q, want chris", got)
+	}
+	// Final fallback when neither is set.
+	if got := resolveRemoteLane("", ""); got != "remote" {
+		t.Errorf("resolveRemoteLane(\"\", \"\") = %q, want remote", got)
+	}
+}
+
+func TestParseRemoteLaneID(t *testing.T) {
+	// A real remote-claude-new launch (with the absolute script path) parses lane+id.
+	cmd := "/Users/c2k/repos/agent-deck/scripts/remote-claude-new chris 20260624-174229-768"
+	if lane, id, ok := parseRemoteLaneID(cmd); !ok || lane != "chris" || id != "20260624-174229-768" {
+		t.Errorf("parseRemoteLaneID(%q) = (%q, %q, %v), want (chris, 20260624-174229-768, true)", cmd, lane, id, ok)
+	}
+
+	// A trailing model arg doesn't change lane/id extraction.
+	cmd = "/x/remote-claude-new ck 20260101-000000-1 sonnet"
+	if lane, id, ok := parseRemoteLaneID(cmd); !ok || lane != "ck" || id != "20260101-000000-1" {
+		t.Errorf("parseRemoteLaneID with model = (%q, %q, %v), want (ck, 20260101-000000-1, true)", lane, id, ok)
+	}
+
+	// A non-remote command (a worker/shell session) is not a remote launch.
+	if _, _, ok := parseRemoteLaneID("claude"); ok {
+		t.Errorf("parseRemoteLaneID(\"claude\") ok = true, want false")
+	}
+	// remote-claude-new with no args -> not enough fields, ok=false (caller skips teardown).
+	if _, _, ok := parseRemoteLaneID("/x/remote-claude-new"); ok {
+		t.Errorf("parseRemoteLaneID with no args ok = true, want false")
+	}
+}
+
+func TestMaiaWorkerPicker_RemoteHint(t *testing.T) {
+	p := &MaiaWorkerPicker{
+		visible: true,
+		workers: []string{"/r/MAIA.worker-1"},
+		width:   120,
+		height:  30,
+	}
+	if !strings.Contains(p.View(), "R remote") {
+		t.Errorf("hint should advertise the remote hotkey; got:\n%s", p.View())
+	}
+}
+
 func TestWorkerSortKey(t *testing.T) {
 	if a, b := workerSortKey("/r/MAIA.worker-2"), workerSortKey("/r/MAIA.worker-10"); a >= b {
 		t.Errorf("worker-2 (%d) should sort before worker-10 (%d)", a, b)

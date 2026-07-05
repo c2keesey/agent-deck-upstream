@@ -21,7 +21,53 @@ const (
 	maiaWorkerGroup    = "maia/active"
 	maiaRoDevGroup     = "maia/read-only-dev"
 	maiaConductorGroup = "maia/conductor"
+	maiaRemoteGroup    = "maia/remote"
 )
+
+// maiaRemoteScript is the agent-deck -cmd body for the 'R' (remote) hotkey: it
+// creates a fresh ephemeral worktree on the shared dev box and attaches an
+// interactive remote Claude TUI in it. It ships self-contained in this repo's
+// scripts/ (no MAIA cross-repo path dependency); it only mirrors the MAIA skill's
+// ephemeral-marker schema so remote-prune/remote-reclaim can clean up after it.
+// Hardcoded path, matching maiaReposDir's personal-fork style.
+const maiaRemoteScript = "/Users/c2k/repos/agent-deck/scripts/remote-claude-new"
+
+// maiaReclaimBoxScript tears down the BOX side of a remote session (make-recoverable
+// + remote-prune) without removing the local agent-deck session. deleteSession runs
+// it when a maia/remote* session is deleted via the TUI, so the box worktree + tmux
+// don't leak. Self-contained sibling of remote-claude-new in this repo's scripts/.
+const maiaReclaimBoxScript = "/Users/c2k/repos/agent-deck/scripts/remote-reclaim-box"
+
+// parseRemoteLaneID extracts the lane and ephemeral id from a remote session's stored
+// command (`…/remote-claude-new <lane> <id> [model]`), so the delete hook can target
+// the right box worktree. ok is false when the command isn't a remote-claude-new
+// launch — the caller then skips the box teardown.
+func parseRemoteLaneID(command string) (lane, id string, ok bool) {
+	if !strings.Contains(command, "remote-claude-new") {
+		return "", "", false
+	}
+	fields := strings.Fields(command)
+	for i, f := range fields {
+		if strings.HasSuffix(f, "remote-claude-new") && i+2 < len(fields) {
+			return fields[i+1], fields[i+2], true
+		}
+	}
+	return "", "", false
+}
+
+// resolveRemoteLane picks the box lane name for a remote session, mirroring the
+// remote-* scripts' default chain (MAIA_REMOTE_LANE → $USER → "remote") so a
+// picker-launched session lands in the same ephemeral worktree namespace as a
+// scripted dispatch.
+func resolveRemoteLane(envLane, envUser string) string {
+	if envLane != "" {
+		return envLane
+	}
+	if envUser != "" {
+		return envUser
+	}
+	return "remote"
+}
 
 // MaiaWorkerPicker is the new-session picker for MAIA work. It shows a single
 // Workers column: worker worktrees (MAIA.worker-*), with the cursor defaulting
@@ -218,7 +264,7 @@ func (m *MaiaWorkerPicker) View() string {
 		body = m.renderColumn("Workers", m.workers, m.workerCursor, true, true)
 	}
 
-	hintText := "↑/↓ pick · Tab tool · Enter worker · c conductor · r ro-dev · s shell · ~ home · Esc"
+	hintText := "↑/↓ pick · Tab tool · Enter worker · c conductor · r ro-dev · R remote · s shell · ~ home · Esc"
 	hint := lipgloss.NewStyle().Foreground(ColorComment).Render(hintText)
 
 	content := lipgloss.JoinVertical(lipgloss.Left, title, "", toolBar, "", body, "", hint)

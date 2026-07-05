@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+#
+# remote-reclaim-box: the BOX-ONLY half of the MAIA skill's `remote-reclaim`, for use
+# from agent-deck's own session-delete path. It makes the ephemeral worktree's work
+# recoverable (commit+push, never stash) then delegates box teardown (tmux kill →
+# make down → git worktree remove → branch/marker cleanup) to `remote-prune
+# --prune-one`. It does NOT run `agent-deck remove` — agent-deck is already removing
+# the local session when it calls this, so the local-remove step would double-fire.
+#
+# Why it lives here (not just calling remote-reclaim): the MAIA `remote-reclaim`'s
+# final step IS the local agent-deck remove, which races agent-deck's own deletion.
+# This is steps 1+2 only. It stays in lockstep with remote-reclaim's recovery
+# semantics + the ephemeral identity (worktree ~/MAIA-<lane>-<id>, marker
+# ~/.maia-ephemeral/<lane>-<id>.json); mirror that script if either changes.
+#
+# Config:  MAIA_REMOTE_HOST   SSH target (default: the team box).
+# Usage:   remote-reclaim-box <lane> <id> [--force]
+set -euo pipefail
+
+HOST="${MAIA_REMOTE_HOST:-maia-server@maia-server.tailbe95fd.ts.net}"
+LANE="${1:?lane required}"
+ID="${2:?id required (the ephemeral id; e.g. 20260624-174229-768)}"
+FORCE=0
+[[ "${3:-}" == "--force" ]] && FORCE=1
+
+# Grammar-guard before lane/id flow into the remote SSH zsh strings — a single quote
+# in either would break out of the '...' quoting. Parity with the MAIA scripts.
+if [[ ! "$LANE" =~ ^[a-zA-Z0-9_-]+$ || ! "$ID" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo "ERROR: invalid lane '$LANE' or id '$ID' (expected [a-zA-Z0-9_-]+)." >&2; exit 2
+fi
+
+WT="MAIA-${LANE}-${ID}"
+
+# 1. Make the work recoverable on the box (unless --force). Push unpushed commits to
+#    their own branch; commit+push dirty work to a recovery ref. No-op when already
+#    clean+pushed. Failure aborts BEFORE teardown, so nothing is removed until the
+#    work is safely on origin. (Verbatim from remote-reclaim step 1.)
+if [[ "$FORCE" != "1" ]]; then
+  echo "→ ensuring ~/$WT work is recoverable (commit+push if needed) ..." >&2
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "zsh -lc '
+    set -e
+    cd ~/$WT 2>/dev/null || { echo \"  worktree ~/$WT already gone — nothing to preserve\"; exit 0; }
+    cur=\$(git branch --show-current)
+    if [ -n \"\$(git status --porcelain)\" ]; then
+      echo \"  dirty → committing + pushing to recovery/eph-${LANE}-${ID}\"
+      git add -A
+      git commit -q -m \"wip(reclaim): ${LANE}-${ID} preserved by agent-deck delete\"
+      git push -q origin HEAD:refs/heads/recovery/eph-${LANE}-${ID}
+    elif [ \"\$(git rev-list --count HEAD --not --remotes 2>/dev/null || echo 1)\" != \"0\" ]; then
+      echo \"  unpushed commits on \$cur → git push\"
+      git push -q origin HEAD:refs/heads/\$cur
+    else
+      echo \"  already recoverable (clean + pushed)\"
+    fi'" >&2 || {
+      echo "ABORT: could not make ~/$WT recoverable (push failed?). Nothing removed. Re-run with --force to override." >&2
+      exit 2; }
+fi
+
+# 2. Delegate box teardown to the prune authority (the only thing allowed to run
+#    `git worktree remove` for ephemeral worktrees). Absolute path in the box's
+#    PRIMARY checkout, not a bare name (a pre-2592 ~/.local/bin symlink set may lack it).
+BOX_PRUNE='~/MAIA/.claude/skills/delegate-to-remote/scripts/remote-prune'
+PRUNE_ARGS=(--prune-one "${LANE}-${ID}")
+[[ "$FORCE" == "1" ]] && PRUNE_ARGS+=(--force)
+if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "zsh -lc '$BOX_PRUNE ${PRUNE_ARGS[*]}'" >&2; then
+  echo "ERROR: box teardown (remote-prune --prune-one) failed for $WT." >&2
+  exit 3
+fi
+
+echo "✓ box-reclaimed $WT" >&2

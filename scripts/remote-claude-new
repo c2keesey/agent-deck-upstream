@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+#
+# remote-claude-new: the agent-deck -cmd body for the MAIA new-session picker's
+# 'R' (remote) hotkey. Idempotently create a fresh ephemeral worktree on the shared
+# MAIA dev box, provision its env, then attach an interactive bypass-permissions
+# Claude TUI in it — over the tailnet. No task is sent; the human/conductor drives it.
+#
+# This is the INTERACTIVE sibling of the /delegate-to-remote skill's `remote-dispatch`
+# (which lives in the MAIA repo). It is deliberately SELF-CONTAINED — it does NOT
+# depend on the MAIA-side `remote-claude` script — so the picker has no cross-repo
+# path dependency. The one contract it MUST keep in lockstep with the MAIA skill is
+# the ephemeral identity + marker schema below (worktree ~/MAIA-<lane>-<id>, branch
+# eph/<lane>-<id>, tmux maia-<lane>-<id>, marker ~/.maia-ephemeral/<lane>-<id>.json
+# with fields lane/id/worktree/branch/tmux/created_epoch). remote-prune /
+# remote-reclaim / the box system-maintainer enumerate worktrees SOLELY by that
+# marker, so a drift here orphans worktrees. Mirror remote-dispatch if it changes.
+#
+# REVIVE-SAFE: agent-deck generates <id> ONCE and bakes it into the stored -cmd, and
+# worktree creation is skipped when ~/MAIA-<lane>-<id> already exists. So an
+# agent-deck revive / SSH-drop re-attach re-uses the SAME worktree + box tmux
+# (`new-session -A`) instead of spawning a second one per restart.
+#
+# Config (env vars, defaults match the MAIA skill):
+#   MAIA_REMOTE_HOST   SSH target for the box (default: the team box).
+#   MAIA_REMOTE_LANE   your box lane name (default: $USER).
+#
+# Usage: remote-claude-new [lane] <id> [model]
+#   lane    box lane name (default: $MAIA_REMOTE_LANE, else $USER)
+#   id      ephemeral id (REQUIRED) — agent-deck generates it and bakes it into -cmd
+#   model   optional --model override; use a STABLE model for long unattended runs
+set -euo pipefail
+
+LANE="${1:-${MAIA_REMOTE_LANE:-$USER}}"
+ID="${2:?id required — agent-deck generates it and bakes it into the -cmd so revive re-attaches the same worktree}"
+MODEL="${3:-}"
+HOST="${MAIA_REMOTE_HOST:-maia-server@maia-server.tailbe95fd.ts.net}"
+
+# Grammar-guard lane/id/model before they flow into the nested-quoted remote git/tmux
+# commands — a quote or ';' would break out of that string (parity with the MAIA scripts).
+if [[ ! "$LANE" =~ ^[a-zA-Z0-9_-]+$ || ! "$ID" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo "ERROR: invalid lane '$LANE' or id '$ID' (expected [a-zA-Z0-9_-]+)." >&2; exit 2
+fi
+if [ -n "$MODEL" ] && [[ ! "$MODEL" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+  echo "ERROR: invalid model '$MODEL'." >&2; exit 2
+fi
+
+WT="MAIA-${LANE}-${ID}"            # box worktree dir name (~/$WT)
+EPH_BRANCH="eph/${LANE}-${ID}"     # holding branch off origin/dev
+TMUX_NAME="maia-${LANE}-${ID}"     # box tmux session name
+
+# First-run only: create the worktree + env + marker. `git worktree add` fails if
+# ~/$WT already exists, so gating on its presence keeps this idempotent across
+# revive / re-attach (every later run skips straight to the attach below).
+if ! ssh -o BatchMode=yes "$HOST" "test -d ~/$WT" 2>/dev/null; then
+  echo "→ creating box worktree ~/$WT off origin/dev ..." >&2
+  ssh -o BatchMode=yes "$HOST" \
+    "zsh -lc 'git -C ~/MAIA fetch -q origin dev && git -C ~/MAIA worktree add ~/$WT -b $EPH_BRANCH origin/dev && git -C ~/$WT log --oneline -1'" >&2 || {
+      echo "ERROR: could not create box worktree ~/$WT (git worktree add failed)." >&2; exit 7; }
+
+  # Symlink the shared gitignored env files (server/config/.env*, firebase SA, client
+  # local config) from the box's primary ~/MAIA into the fresh worktree, so it isn't
+  # missing config. worktree-setup.sh auto-detects ~/MAIA as the source and only needs
+  # cwd = the new worktree. Cheap + idempotent. The heavier docker stack stays
+  # on-demand — run /setup-local-dev inside the session when you want a live API/browser.
+  # Non-fatal: a failure here shouldn't block the attach; the agent (bypass-permissions)
+  # can recover with /setup-local-dev.
+  echo "→ provisioning env symlinks (worktree-setup.sh) ..." >&2
+  ssh -o BatchMode=yes "$HOST" \
+    "zsh -lc 'cd ~/$WT && ./scripts/worktree-setup.sh'" >&2 \
+    || echo "WARN: worktree-setup.sh failed — env files may be missing; run /setup-local-dev in the session." >&2
+
+  # The marker is the SOLE discovery signal for prune/reclaim/the maintainer sweep —
+  # a worktree without one is an orphan nothing can enumerate or clean up. So marker
+  # creation is REQUIRED: if we can't plant it, roll the just-created worktree back
+  # and abort BEFORE attaching (mirrors remote-dispatch's marker_fail).
+  MARKER_JSON="$(python3 -c 'import json,sys,time
+print(json.dumps({"lane":sys.argv[1],"id":sys.argv[2],"worktree":sys.argv[3],
+  "branch":sys.argv[4],"tmux":sys.argv[5],"created_epoch":int(time.time())}))' \
+    "$LANE" "$ID" "$WT" "$EPH_BRANCH" "$TMUX_NAME")"
+  marker_fail() {
+    echo "ERROR: $1 — rolling back ~/$WT and aborting." >&2
+    ssh -o BatchMode=yes "$HOST" "zsh -lc '
+      git -C ~/MAIA worktree remove --force ~/$WT 2>/dev/null
+      git -C ~/MAIA branch -D $EPH_BRANCH 2>/dev/null
+      git -C ~/MAIA worktree prune 2>/dev/null'" >&2 || true
+    exit 8
+  }
+  [[ -z "$MARKER_JSON" ]] && marker_fail "could not build ephemeral marker for $WT"
+  ssh -o BatchMode=yes "$HOST" \
+    "zsh -lc 'mkdir -p ~/.maia-ephemeral && cat > ~/.maia-ephemeral/${LANE}-${ID}.json'" <<<"$MARKER_JSON" >&2 \
+    || marker_fail "could not write ephemeral marker for $WT"
+  echo "  reclaim with:  remote-reclaim <session-id> $LANE $ID" >&2
+fi
+
+# Attach the remote Claude TUI. Inlined from the MAIA skill's `remote-claude` (kept
+# self-contained on purpose — see header). The claude runs inside a named tmux session
+# ON THE BOX (`maia-<lane>-<id>`), NOT as the SSH foreground process, so an SSH drop /
+# laptop sleep / lid close DETACHES the tmux instead of SIGHUPing claude — the work
+# keeps running and re-running this wrapper re-attaches. `new-session -A` is safe on the
+# UNIQUE per-launch name (the MAIA-2592 stale-reattach bug was a FIXED per-lane name).
+# Bypass-permissions for unattended autonomy in an isolated worktree.
+MODEL_FLAG=""
+[ -n "$MODEL" ] && MODEL_FLAG="--model ${MODEL}"
+REMOTE_CLAUDE="cd ~/${WT} && exec claude --dangerously-skip-permissions ${MODEL_FLAG}"
+exec ssh -t \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o BatchMode=yes \
+  "$HOST" \
+  "zsh -lc \"tmux new-session -A -s ${TMUX_NAME} zsh -lc '${REMOTE_CLAUDE}'\""

@@ -5198,6 +5198,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.killErr != nil {
 			h.setError(fmt.Errorf("warning: tmux session may still be running: %w", msg.killErr))
 		}
+		// Report a MAIA remote box-teardown failure so a silent box leak is visible.
+		if msg.remoteReclaimErr != nil {
+			h.setError(msg.remoteReclaimErr)
+		}
 
 		// Find and remove from list
 		var deletedInstance *session.Instance
@@ -10963,6 +10967,13 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return h, nil
 		}
 		return h, h.createMaiaWorkerSession(selected, group, tool)
+	case "R":
+		// Remote: create a session whose -cmd spins up a fresh ephemeral worktree
+		// on the shared dev box and attaches an interactive remote Claude TUI in
+		// it (the /delegate-to-remote skill's interactive path). Always Claude —
+		// the box runs claude, so the tool switcher doesn't apply here.
+		h.maiaWorkerPicker.Hide()
+		return h, h.createMaiaRemoteSession()
 	case "~":
 		// Spawn the active tool rooted at the home dir — a quick scratch
 		// session outside the MAIA worktrees. Group is derived from the path.
@@ -11024,6 +11035,49 @@ func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.C
 		"",
 		false,     // not auto-named
 		lockTitle, // MAIA workers (non ro-dev group) lock the title
+	)
+}
+
+// createMaiaRemoteSession launches a session whose -cmd creates a fresh ephemeral
+// worktree on the shared dev box and attaches an interactive remote Claude TUI in
+// it (the /delegate-to-remote skill's interactive path — no task is sent, the user
+// drives the remote Claude directly). The ephemeral id is generated HERE and baked
+// into the command so an agent-deck revive / SSH-drop re-attach re-uses the SAME
+// worktree (and box tmux) instead of spawning a second one per restart.
+//
+// The command resolves to the "shell" tool (it's not a bare "claude"), exactly like
+// createSSHSession's optiplex login — which is what we want: revive re-runs the
+// -cmd, and remote-claude's `tmux new-session -A` on the box handles persistence.
+// Rooted at the home dir; the work lives remotely, this is only the local pane cwd.
+func (h *Home) createMaiaRemoteSession() tea.Cmd {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+
+	lane := resolveRemoteLane(os.Getenv("MAIA_REMOTE_LANE"), os.Getenv("USER"))
+	// Ephemeral per-launch id (digits + '-', grammar-safe for the script's lane/id
+	// guard). Generated once and frozen into the stored command for revive safety.
+	id := time.Now().Format("20060102-150405") + "-" + strconv.Itoa(os.Getpid())
+	command := fmt.Sprintf("%s %s %s", maiaRemoteScript, lane, id)
+
+	h.instancesMu.RLock()
+	name := session.GenerateUniqueSessionName(h.instances, maiaRemoteGroup)
+	h.instancesMu.RUnlock()
+
+	return h.createSessionInGroupWithWorktreeAndOptions(
+		name, home, command,
+		maiaRemoteGroup,
+		"", "", "", // no local worktree (the worktree is created remotely by the -cmd)
+		false, false, nil,
+		nil, // no extra claude args
+		"",  // no claude startup query
+		"",  // no explicit model override
+		false, nil,
+		"", "",
+		"",
+		false, // not auto-named
+		true,  // lock the title like workers (agent-deck can't see the box .jsonl)
 	)
 }
 
@@ -11782,8 +11836,9 @@ func forkWithStateWorkspaceJJ(parentPath, repoRoot, workspacePath, branch string
 
 // sessionDeletedMsg signals that a session was deleted
 type sessionDeletedMsg struct {
-	deletedID string
-	killErr   error // Error from Kill() if any
+	deletedID        string
+	killErr          error // Error from Kill() if any
+	remoteReclaimErr error // MAIA remote: box-side teardown (remote-reclaim-box) failed
 }
 
 // sessionClosedMsg signals that a session process was closed without deleting metadata.
@@ -11817,6 +11872,14 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	isMultiRepo := inst.IsMultiRepo()
 	multiRepoTempDir := inst.MultiRepoTempDir
 	multiRepoWorktrees := inst.MultiRepoWorktrees
+	// MAIA remote sessions (group maia/remote*) have no local worktree — the real
+	// worktree + tmux live on the dev box, so a local delete kills only the SSH pane
+	// and would leak the box worker. Snapshot the lane/id from the command now (under
+	// no lock; plain fields) so the closure can fire the box-side teardown.
+	remoteLane, remoteID, isRemote := "", "", false
+	if strings.HasPrefix(inst.GroupPath, maiaRemoteGroup) {
+		remoteLane, remoteID, isRemote = parseRemoteLaneID(inst.Command)
+	}
 	// #1449: snapshot whether another live session still shares this worktree,
 	// under the lock, before the async closure runs (which must not touch
 	// h.instances). When shared, the worktree dir + branch are left intact and
@@ -11832,6 +11895,28 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	}
 	return func() tea.Msg {
 		killErr := inst.Kill()
+		var remoteReclaimErr error
+		if isRemote {
+			// Best-effort box teardown: make-recoverable (commit+push) + remote-prune.
+			// A 'd' delete is user-initiated removal, so don't block local deletion on
+			// box reachability — surface a UI warning and proceed. The box marker keeps
+			// the worktree discoverable for a later remote-prune --sweep if this fails
+			// (e.g. box offline). make down on an idle worktree is quick; a session that
+			// ran /setup-local-dev makes this take longer.
+			out, rErr := exec.Command(maiaReclaimBoxScript, remoteLane, remoteID).CombinedOutput()
+			if rErr != nil {
+				uiLog.Warn("maia_remote_reclaim_failed",
+					slog.String("id", id), slog.String("lane", remoteLane), slog.String("eph_id", remoteID),
+					slog.String("err", rErr.Error()), slog.String("out", strings.TrimSpace(string(out))))
+				// Surface to the TUI so a silent box leak can't slip by. Include the last
+				// line of script output (the ABORT/ERROR reason) for a self-explaining banner.
+				remoteReclaimErr = fmt.Errorf("box teardown of MAIA-%s-%s failed (run remote-reclaim manually): %s",
+					remoteLane, remoteID, lastNonBlankLine(string(out)))
+			} else {
+				uiLog.Info("maia_remote_reclaimed",
+					slog.String("id", id), slog.String("lane", remoteLane), slog.String("eph_id", remoteID))
+			}
+		}
 		if isWorktree && sharedWorktree {
 			// #1449: another live session still references this worktree; skip
 			// the destructive removal + branch delete and merely drop this
@@ -11866,8 +11951,20 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 				}
 			}
 		}
-		return sessionDeletedMsg{deletedID: id, killErr: killErr}
+		return sessionDeletedMsg{deletedID: id, killErr: killErr, remoteReclaimErr: remoteReclaimErr}
 	}
+}
+
+// lastNonBlankLine returns the trimmed last non-empty line of s (the script's
+// final ABORT/ERROR reason), for a compact self-explaining UI banner.
+func lastNonBlankLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 // captureAutoNameBeforeStop persists an auto-named session's live Claude task

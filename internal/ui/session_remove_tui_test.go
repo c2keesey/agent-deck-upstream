@@ -75,6 +75,9 @@ func TestSessionRemoveTUI_CapitalX_OnRunning_ShowsError(t *testing.T) {
 	}
 }
 
-// Personal fork: upstream's Ctrl+X "bulk-remove all errored sessions" was
+// Personal fork: upstream's Ctrl+X "bulk-remove all errored sessions" is
 // dropped here — Ctrl+X is remapped to "close session" in the local hotkey
 // scheme, so the bulk-remove tests (and bulkRemoveErrored) were removed.
+// Upstream periodically reintroduces this feature (e.g. #1521); each sync
+// re-drops it — the reintroduced bulkRemoveErrored/ShowBulkRemoveErrored/
+// ConfirmBulkRemoveErrored symbols are stripped rather than wired to a key.

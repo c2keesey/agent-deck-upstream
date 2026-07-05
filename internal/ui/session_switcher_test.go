@@ -243,6 +243,110 @@ func TestSessionSwitcher_ViewRendersTitlesAndFooter(t *testing.T) {
 	}
 }
 
+// TestSessionSwitcher_ViewPromotesLiveActivityOverHandle pins the LOCAL fork's
+// switcher label behavior. Upstream's version (ViewUsesAutoNameDescription)
+// routes titles through sessionDisplayLabels inside Show(); the fork instead
+// computes primary labels via primaryLabelFor in openSessionSwitcher and assigns
+// them to sw.labels — this test mirrors that path. The fork promotes a session's
+// LIVE pane title (primaryBroadcast) over its random auto-name handle, which is
+// the meaningful anti-regression. It deliberately does NOT promote a persisted
+// AutoNameDescription when there is no live activity (that is an upstream-only
+// behavior; the fork's label engine falls back to the handle there).
+func TestSessionSwitcher_ViewPromotesLiveActivityOverHandle(t *testing.T) {
+	InitTheme("dark")
+
+	now := time.Now()
+	// Auto-named quick session: Title is the machine handle; the live Claude
+	// task description arrives via the subtitles map (the cleaned pane title).
+	live := &session.Instance{ID: "x", Title: "amber-fox", Tool: "claude", Status: session.StatusRunning, LastAccessedAt: now}
+	live.SetAutoName(true)
+	// Second live session so Show (which needs ≥2 switchable sessions) succeeds.
+	other := &session.Instance{ID: "y", Title: "my-feature", Tool: "claude", Status: session.StatusRunning, LastAccessedAt: now.Add(-time.Minute)}
+	list := []*session.Instance{live, other}
+
+	sw := NewSessionSwitcher()
+	sw.SetSize(80, 24)
+	subtitles := map[string]string{"x": "fix the login bug"}
+	if !sw.Show("x", list, subtitles) {
+		t.Fatal("Show returned false")
+	}
+	// Mirror openSessionSwitcher: the switcher's labels come from the fork's
+	// primary-label engine, not from Show().
+	sw.labels = map[string]primaryLabel{
+		"x": primaryLabelFor(live, sessionRenderState{paneTitle: subtitles["x"]}, nil),
+		"y": primaryLabelFor(other, sessionRenderState{}, nil),
+	}
+
+	view := sw.View()
+	if !strings.Contains(view, "fix the login bug") {
+		t.Errorf("switcher should show the live Claude task description, got:\n%s", view)
+	}
+	if strings.Contains(view, "amber-fox") {
+		t.Errorf("switcher should not show the random handle when live activity exists, got:\n%s", view)
+	}
+	// The live pane title must appear exactly once (as the primary label), not
+	// also as a dim subtitle — primaryBroadcast suppresses the subtitle.
+	if n := strings.Count(view, "fix the login bug"); n != 1 {
+		t.Errorf("live pane title should render once, got %d occurrences:\n%s", n, view)
+	}
+}
+
+// maxLineCellWidth returns the widest rendered line of view in terminal cells.
+func maxLineCellWidth(view string) int {
+	widest := 0
+	for _, line := range strings.Split(view, "\n") {
+		if w := cellWidth(line); w > widest {
+			widest = w
+		}
+	}
+	return widest
+}
+
+// TestSessionSwitcher_ViewFixedWidthTruncatesLongTitles pins the LOCAL fork's
+// switcher renderer, which diverges from upstream's auto-width dialog: the fork
+// uses a fixed comfortable width (70, clamped toward the terminal when narrow,
+// with a 40-cell floor) and a scroll window rather than growing to fit the
+// widest title. Long titles are therefore truncated to the name column with an
+// ellipsis at every terminal width — the box never expands to show them in full.
+// (Upstream's TestSessionSwitcher_ViewAutoExpandsToFitLongTitles was rewritten
+// here to pin the fork's fixed-width behavior instead of deleting the coverage.)
+func TestSessionSwitcher_ViewFixedWidthTruncatesLongTitles(t *testing.T) {
+	InitTheme("dark")
+
+	now := time.Now()
+	longTitle := "implement the new authentication flow with oauth and refresh token rotation"
+	long := &session.Instance{ID: "x", Title: longTitle, Tool: "claude", Status: session.StatusRunning, LastAccessedAt: now}
+	other := &session.Instance{ID: "y", Title: "short", Tool: "claude", Status: session.StatusRunning, LastAccessedAt: now.Add(-time.Minute)}
+	list := []*session.Instance{long, other}
+
+	// Wide terminal: the fixed-width box does NOT grow to fit the long title — it
+	// stays at its comfortable width and truncates the title into the name column.
+	sw := NewSessionSwitcher()
+	sw.SetSize(200, 24)
+	sw.Show("x", list, nil)
+	if v := sw.View(); strings.Contains(v, longTitle) {
+		t.Errorf("fixed-width switcher should truncate the long title even on a wide terminal, got:\n%s", v)
+	}
+	if v := sw.View(); !strings.Contains(v, "…") {
+		t.Errorf("long title should be truncated with an ellipsis, got:\n%s", v)
+	}
+
+	// Narrow terminal: the box clamps toward the terminal and still truncates.
+	const narrow = 50
+	sw.SetSize(narrow, 24)
+	sw.Show("x", list, nil)
+	v := sw.View()
+	if strings.Contains(v, longTitle) {
+		t.Errorf("narrow terminal should truncate the long title, got:\n%s", v)
+	}
+	if !strings.Contains(v, "…") {
+		t.Errorf("narrow terminal should show a truncation ellipsis, got:\n%s", v)
+	}
+	if w := maxLineCellWidth(v); w > narrow {
+		t.Errorf("rendered switcher width %d exceeds terminal width %d:\n%s", w, narrow, v)
+	}
+}
+
 // TestSessionSwitcher_FooterEscReflectsContext pins the Esc hint: it says
 // "Esc back" only when the picker was opened while attached (Esc re-attaches),
 // and "Esc close" when opened from the overview (Esc just closes).

@@ -56,7 +56,13 @@ const (
 	// Session switcher. While attached it is intercepted in the tmux attach
 	// loop (see internal/tmux/pty.go AttachOptions); on the home screen it is
 	// dispatched like any other hotkey. Must resolve to a "ctrl+<letter>" chord.
-	hotkeySwitchSession = "switch_session" // Ctrl+S
+	//
+	// LOCAL fork: bound to Ctrl+W by default (see defaultHotkeyBindings), so the
+	// canonical dispatch token is "ctrl+w" and the home-screen arm is
+	// `case "ctrl+w"`. Upstream ships this unbound/opt-in on Ctrl+S; the fork
+	// keeps it always-on because the MRU-ordered switcher is the primary switch
+	// UX. Ctrl+S stayed problematic (XOFF / Cmd+Right on some terminals).
+	hotkeySwitchSession = "switch_session" // canonical "ctrl+w" (local remap)
 )
 
 var hotkeyActionOrder = []string{
@@ -183,6 +189,16 @@ var renamedHotkeys = map[string]string{
 	"toggle_gemini_yolo": hotkeyToggleYolo,
 }
 
+// defaultDisabledHotkeys are actions that keep a canonical key in
+// defaultHotkeyBindings (so the home-screen dispatch case and help/status
+// labels resolve) but ship UNBOUND: resolveHotkeys drops them unless the user
+// binds them explicitly. Upstream lists switch_session here (opt-in Ctrl+S); the
+// LOCAL fork instead remaps switch_session to Ctrl+W and keeps it BOUND by
+// default (the MRU-ordered switcher is the fork's primary switch UX), so it is
+// deliberately NOT disabled here. The map stays for any future upstream opt-in
+// actions.
+var defaultDisabledHotkeys = map[string]bool{}
+
 func resolveHotkeys(overrides map[string]string) map[string]string {
 	bindings := make(map[string]string, len(defaultHotkeyBindings))
 	for action, key := range defaultHotkeyBindings {
@@ -224,6 +240,15 @@ func resolveHotkeys(overrides map[string]string) map[string]string {
 			continue
 		}
 		bindings[action] = key
+	}
+
+	// Opt-in actions ship unbound: drop them unless the user set them
+	// explicitly. The canonical default stays in defaultHotkeyBindings so the
+	// dispatch case and labels resolve once a user binds it.
+	for action := range defaultDisabledHotkeys {
+		if _, overridden := canonicalOverrides[action]; !overridden {
+			delete(bindings, action)
+		}
 	}
 
 	return bindings

@@ -23,11 +23,14 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
-// TestSortByActionable_RegressionFor857 verifies the actionable sort FUNCTION
-// still surfaces error/waiting/running ahead of idle/stopped (#857). The Order
-// values are reversed vs. the desired actionable order so an Order-only sort
-// would flip at least four positions.
-func TestSortByActionable_RegressionFor857(t *testing.T) {
+// TestSessionList_SortByActionable_RegressionFor857 sets up five sessions in
+// one group — one each of running/waiting/error/idle/stopped — and asserts
+// the rendered order is the actionable order, not the persisted Order. The
+// `Order` values intentionally invert the desired output so a regression to
+// the old Order-based sort flips at least four positions.
+func TestSessionList_SortByActionable_RegressionFor857(t *testing.T) {
+	session.SetGroupSortMode("actionable")
+	t.Cleanup(func() { session.SetGroupSortMode("creation") })
 	now := time.Now()
 	instances := []*session.Instance{
 		{ID: "run", Title: "running-sess", GroupPath: "g", Order: 1, Status: session.StatusRunning, LastAccessedAt: now.Add(-1 * time.Minute)},
@@ -52,9 +55,14 @@ func TestSortByActionable_RegressionFor857(t *testing.T) {
 	}
 }
 
-// TestSortByActionable_TimestampTieBreak verifies the function's secondary sort:
-// within one status the recently-accessed session surfaces first.
-func TestSortByActionable_TimestampTieBreak(t *testing.T) {
+// TestSessionList_SortByActionable_TimestampTieBreak verifies the secondary
+// sort: when two sessions share the same status, the one accessed more
+// recently surfaces first. Mirrors the issue's "ready for me" intuition —
+// the actionable session you just left should stay above one you parked
+// hours ago.
+func TestSessionList_SortByActionable_TimestampTieBreak(t *testing.T) {
+	session.SetGroupSortMode("actionable")
+	t.Cleanup(func() { session.SetGroupSortMode("creation") })
 	now := time.Now()
 	instances := []*session.Instance{
 		{ID: "old-wait", Title: "old", GroupPath: "g", Order: 1, Status: session.StatusWaiting, LastAccessedAt: now.Add(-3 * time.Hour)},

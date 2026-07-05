@@ -21,8 +21,11 @@ const (
 	ConfirmInstallHooks
 	ConfirmDeleteRemoteSession
 	ConfirmCloseRemoteSession
-	ConfirmRemoveSession     // status-gated registry-only remove (TUI 'X')
-	ConfirmBulkRemoveErrored // bulk remove of all errored sessions (TUI Ctrl+X)
+	ConfirmRemoveSession // status-gated registry-only remove (TUI 'X')
+	// NOTE: upstream's ConfirmBulkRemoveErrored (bulk remove of all errored
+	// sessions, upstream Ctrl+X) is intentionally NOT reintroduced here — the
+	// fork remaps Ctrl+X to "close session", so the feature has no home key and
+	// is dropped (see session_remove_tui_test.go). (local fork)
 	ConfirmArchiveSession
 	ConfirmUnarchiveSession
 	ConfirmNotice // acknowledge-only message (single OK button), e.g. protected-action blocks
@@ -147,18 +150,6 @@ func (c *ConfirmDialog) ShowRemoveSession(sessionID string, sessionName string) 
 	c.targetName = sessionName
 	c.buttonCount = 2
 	c.focusedButton = 1 // default to Cancel
-}
-
-// ShowBulkRemoveErrored shows confirmation for removing all errored sessions
-// (TUI Ctrl+X). count is the number of errored sessions that will be removed.
-func (c *ConfirmDialog) ShowBulkRemoveErrored(count int) {
-	c.visible = true
-	c.confirmType = ConfirmBulkRemoveErrored
-	c.targetID = ""
-	c.targetName = ""
-	c.mcpCount = count // reuse mcpCount as a generic integer carrier
-	c.buttonCount = 2
-	c.focusedButton = 1
 }
 
 // ShowDeleteGroup shows confirmation for group deletion
@@ -420,17 +411,6 @@ func (c *ConfirmDialog) View() string {
 		borderColor = ColorYellow
 		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
 			renderButton("Remove", ColorYellow, c.focusedButton == 0), "  ",
-			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
-		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render("y remove · n cancel · ←/→ navigate · Enter select · Esc"))
-
-	case ConfirmBulkRemoveErrored:
-		title = "Remove All Errored Sessions?"
-		warning = fmt.Sprintf("Remove %d errored session(s) from the registry.", c.mcpCount)
-		details = "• Only sessions currently in the 'error' state are affected\n• Claude transcripts are preserved\n• Git worktrees are preserved"
-		borderColor = ColorYellow
-		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
-			renderButton("Remove All", ColorYellow, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y remove · n cancel · ←/→ navigate · Enter select · Esc"))

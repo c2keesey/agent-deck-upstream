@@ -272,7 +272,7 @@ func RefreshSessionCache() {
 	// Subprocess fallback: list-windows -a (3s timeout to prevent freeze when server is dead)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	cmd := tmuxExecContext(ctx, DefaultSocketName(), "list-windows", "-a", "-F", "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}")
+	cmd := tmuxExecContext(ctx, DefaultSocketName(), "list-windows", "-a", "-F", tmuxFmt("#{session_name}", "#{window_activity}", "#{window_index}", "#{window_name}"))
 	output, err := cmd.Output()
 	if err != nil {
 		sessionCacheMu.Lock()
@@ -295,8 +295,10 @@ func RefreshSessionCache() {
 	windowCacheMu.Unlock()
 }
 
-// parseListWindowsOutput parses the output of `tmux list-windows -a` with the extended format
-// "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}"
+// parseListWindowsOutput parses the output of `tmux list-windows -a` with the
+// extended format tmuxFmt("#{session_name}", "#{window_activity}",
+// "#{window_index}", "#{window_name}"). window_name is last so a tmuxFieldSep
+// inside it survives SplitN.
 // Returns session-level max activity and per-session window info.
 func parseListWindowsOutput(output string) (map[string]int64, map[string][]WindowInfo) {
 	sessionCache := make(map[string]int64)
@@ -306,7 +308,7 @@ func parseListWindowsOutput(output string) (map[string]int64, map[string][]Windo
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 4)
+		parts := strings.SplitN(line, tmuxFieldSep, 4)
 		if len(parts) < 2 {
 			continue
 		}
@@ -841,6 +843,13 @@ type Session struct {
 	detectedTool     string
 	toolDetectedAt   time.Time
 	toolDetectExpiry time.Duration // How long before re-detecting (default 30s)
+
+	// Cached background-work probe (BackgroundWorkPending). The hook fast path in
+	// UpdateStatus has no captured pane content, so it must capture separately to
+	// check for in-flight background shells/agents; this bounds that to one
+	// capture per bgWorkCacheTTL while a session sits at the prompt.
+	bgWorkPending   bool
+	bgWorkCheckedAt time.Time
 
 	// Simple state tracking (hash-based)
 	stateTracker *StateTracker
@@ -2144,13 +2153,23 @@ var hasSessionProbeTimeout = 2 * time.Second
 // Uses cached session list when available (refreshed by RefreshExistingSessions)
 // Falls back to direct tmux call if cache is stale
 func (s *Session) Exists() bool {
-	// The session cache is populated by RefreshSessionCache against
-	// DefaultSocketName() only — entries describe the default tmux server
-	// alone. Sessions on isolated sockets must skip the cache, otherwise
-	// UpdateStatus would stamp StatusError on every poll for them (#755).
+	// #755: the cache describes the DefaultSocketName() server, so a session on
+	// a different socket must not be answered from it (a same-named entry is not
+	// the same session). Keep that guard.
+	//
+	// Within the guard, trust only a POSITIVE hit. A NEGATIVE/stale result is
+	// NOT trusted: the cache can transiently miss a live session when
+	// agent-deck sessions span multiple sockets (RefreshAllActivities merges one
+	// pipe per socket, and the subprocess fallback covers only DefaultSocketName,
+	// so a refresh sourced from the "wrong" socket omits this one). Confirm a
+	// "not in cache" reading with the live pipe / a direct probe on the
+	// session's OWN socket before declaring it dead. Trusting a negative cache
+	// hit flipped live sessions on a second socket to StatusError/tmux_missing
+	// (multi-socket cache aliasing), after which restart machinery could kill
+	// the still-running pane.
 	if strings.TrimSpace(s.SocketName) == DefaultSocketName() {
-		if exists, cacheValid := sessionExistsFromCache(s.Name); cacheValid {
-			return exists
+		if exists, cacheValid := sessionExistsFromCache(s.Name); cacheValid && exists {
+			return true
 		}
 	}
 
@@ -2184,8 +2203,15 @@ func (s *Session) IsPaneDead() bool {
 	if info, ok := GetCachedPaneInfo(s.Name); ok {
 		return info.Dead
 	}
-	// Cache miss: direct tmux check targeting the primary pane.
-	out, err := s.tmuxCmd("list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}").Output()
+	// Cache miss: direct tmux check targeting the primary pane. Bound it the
+	// same way Exists() bounds has-session — a wedged tmux server must not hang
+	// this probe, since it runs under the notify-daemon's single-threaded poll
+	// loop (via UpdateStatus → GetStatus) where a stall freezes all delivery.
+	// A timed-out (indeterminate) probe is treated as "not dead": reporting a
+	// live pane as dead would flip the session to an error state.
+	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
+	defer cancel()
+	out, err := s.tmuxCmdContext(ctx, "list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}").Output()
 	if err != nil {
 		return false
 	}
@@ -2389,6 +2415,17 @@ func (s *Session) Kill() error {
 	// Verify old processes are dead; escalate to SIGKILL if needed
 	if len(oldPIDs) > 0 {
 		go s.ensureProcessesDead(oldPIDs, 0)
+	}
+
+	// Killing a session that no longer exists is success, not failure: tmux
+	// `kill-session` exits non-zero ("can't find session") for an already-dead
+	// session. Treating that as fatal made archiveSession abort and silently
+	// fail to persist the archive when re-archiving a session whose tmux was
+	// already gone (the post-Unarchive path — Unarchive clears the flag without
+	// restarting tmux). Only surface the error if the session is genuinely
+	// still alive after the kill attempt.
+	if err != nil && !s.Exists() {
+		return nil
 	}
 
 	return err
@@ -3141,6 +3178,18 @@ func (s *Session) GetStatus() (string, error) {
 				return "active", nil
 			}
 
+			// Foreground turn ended but background work is still in flight: a
+			// run_in_background shell, or a background agent the turn is awaiting.
+			// Claude shows this at the prompt ("N shells still running" /
+			// "Waiting for N background agent to finish") with no spinner, so the
+			// busy check above misses it and the session would flip to waiting
+			// (yellow) and fire a premature "finished" notification. Keep it green
+			// until the work actually completes (then the next poll settles to
+			// waiting and notifies — "done" now means foreground AND background).
+			if s.markBackgroundWorkActiveLocked(content, currentTS, shortName) {
+				return "active", nil
+			}
+
 			// Update content hash for spike detection (deferred until after early return above).
 			// The 500ms CapturePane cache means the spike path gets the same content,
 			// so we store the normalized result once and reuse it via cachedNormContent.
@@ -3310,6 +3359,16 @@ func (s *Session) GetStatus() (string, error) {
 						s.startupAt = time.Time{}
 						statusLog.Debug("sustained_error_banner", slog.String("session", shortName))
 						return "error", nil
+					}
+
+					// Background work in flight keeps the session green here too:
+					// a bg shell's output drives the spike, so without this the
+					// prompt check below would flip it to waiting and fire a
+					// premature completion (mirrors the busy-check path above).
+					if s.markBackgroundWorkActiveLocked(content, currentTS, shortName) {
+						s.stateTracker.activityCheckStart = time.Time{}
+						s.stateTracker.activityChangeCount = 0
+						return "active", nil
 					}
 
 					if s.hasPromptIndicator(content) {
@@ -3748,6 +3807,78 @@ func (s *Session) GetWaitingSince() time.Time {
 func (s *Session) hasBusyIndicator(content string) bool {
 	// Always use spinner movement detection regardless of resolvedPatterns
 	return s.hasBusyIndicatorResolved(content)
+}
+
+// isClaudeTool reports whether this session is running Claude Code, used to gate
+// Claude-shaped pane heuristics (e.g. the background-work footer). Reads cached
+// tool fields without locking; GetStatus callers already hold s.mu.
+func (s *Session) isClaudeTool() bool {
+	return strings.EqualFold(inferToolFromSessionFields(s.detectedTool, s.customToolName, s.Command), "claude")
+}
+
+// bgWorkCacheTTL bounds how often BackgroundWorkPending captures the pane while a
+// session sits at the prompt. CapturePane has its own 500ms cache; this adds a
+// coarser ceiling so the per-tick hook-fast-path probe stays cheap at scale.
+const bgWorkCacheTTL = 3 * time.Second
+
+// BackgroundWorkPending reports whether a Claude session at the prompt still has
+// background work in flight (run_in_background shells or a background agent the
+// turn is awaiting). It captures the pane itself — for the UpdateStatus hook fast
+// path, which short-circuits before GetStatus and so has no captured content —
+// and caches the result briefly (bgWorkCacheTTL). Returns false for non-Claude
+// sessions. Safe to call WITHOUT holding s.mu (acquires it internally; releases
+// it for the slow capture).
+func (s *Session) BackgroundWorkPending() bool {
+	s.mu.Lock()
+	if !s.isClaudeTool() {
+		s.mu.Unlock()
+		return false
+	}
+	if !s.bgWorkCheckedAt.IsZero() && time.Since(s.bgWorkCheckedAt) < bgWorkCacheTTL {
+		pending := s.bgWorkPending
+		s.mu.Unlock()
+		return pending
+	}
+	s.mu.Unlock()
+
+	rawContent, err := s.CapturePane()
+	if err != nil {
+		// Don't cache a capture failure as "no background work": refreshing the
+		// TTL would suppress retries for the full window and could let the
+		// waiting hook fire a premature completion. Keep the previous value and
+		// leave bgWorkCheckedAt unchanged so the next call re-captures.
+		s.mu.Lock()
+		pending := s.bgWorkPending
+		s.mu.Unlock()
+		return pending
+	}
+	pending := claudeBackgroundWorkPending(StripANSI(rawContent))
+
+	s.mu.Lock()
+	s.bgWorkPending = pending
+	s.bgWorkCheckedAt = time.Now()
+	s.mu.Unlock()
+	return pending
+}
+
+// markBackgroundWorkActiveLocked applies the "keep green while background work is
+// in flight" state update when a Claude session is at the prompt but still has
+// run_in_background shells / an awaited background agent. Returns true when it
+// fired (caller should return "active"). Accepts raw or stripped content
+// (StripANSI is idempotent). Must be called with s.mu held.
+func (s *Session) markBackgroundWorkActiveLocked(content string, currentTS int64, shortName string) bool {
+	if !s.isClaudeTool() || !claudeBackgroundWorkPending(StripANSI(content)) {
+		return false
+	}
+	s.stateTracker.lastChangeTime = time.Now()
+	s.stateTracker.realActivityConfirmed = true
+	s.stateTracker.acknowledged = false
+	s.resetPromptNoBusyHoldLocked()
+	s.stateTracker.lastActivityTimestamp = currentTS
+	s.lastStableStatus = "active"
+	s.startupAt = time.Time{}
+	statusLog.Debug("background_work_active", slog.String("session", shortName))
+	return true
 }
 
 var defaultResolvedPatternsCache sync.Map // map[string]*ResolvedPatterns
@@ -5003,22 +5134,24 @@ func InitializeStatusBarOptions() error {
 func RefreshStatusBarImmediate() error {
 	socket := DefaultSocketName()
 	// Get all connected clients, filtering out control mode clients
-	cmd := tmuxExec(socket, "list-clients", "-F", "#{client_name}\t#{client_control_mode}")
+	// client_name is free-text (a pts path) so it goes LAST, after the 0/1
+	// control-mode flag, to stay collision-safe under tmuxFieldSep.
+	cmd := tmuxExec(socket, "list-clients", "-F", tmuxFmt("#{client_control_mode}", "#{client_name}"))
 	output, err := cmd.Output()
 	if err != nil {
 		return nil
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 || parts[0] == "" {
+		parts := strings.SplitN(line, tmuxFieldSep, 2)
+		if len(parts) != 2 || parts[1] == "" {
 			continue
 		}
 		// Skip control mode clients (PipeManager pipes)
-		if parts[1] == "1" {
+		if parts[0] == "1" {
 			continue
 		}
-		_ = tmuxExec(socket, "refresh-client", "-S", "-t", parts[0]).Run()
+		_ = tmuxExec(socket, "refresh-client", "-S", "-t", parts[1]).Run()
 	}
 	return nil
 }
@@ -5068,7 +5201,9 @@ func GetAttachedSessionsOnSockets(sockets ...string) []string {
 // attachedSessionsOnSocket lists the non-control-mode sessions with a client
 // attached on a single tmux socket ("" = default server).
 func attachedSessionsOnSocket(socket string) ([]string, error) {
-	cmd := tmuxExec(socket, "list-clients", "-F", "#{session_name}\t#{client_control_mode}")
+	// session_name is sanitized to [A-Za-z0-9-], so it never contains
+	// tmuxFieldSep; no reordering needed here.
+	cmd := tmuxExec(socket, "list-clients", "-F", tmuxFmt("#{session_name}", "#{client_control_mode}"))
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -5076,7 +5211,7 @@ func attachedSessionsOnSocket(socket string) ([]string, error) {
 
 	var sessions []string
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		parts := strings.SplitN(line, "\t", 2)
+		parts := strings.SplitN(line, tmuxFieldSep, 2)
 		if len(parts) != 2 || parts[0] == "" {
 			continue
 		}

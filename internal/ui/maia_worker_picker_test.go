@@ -1,28 +1,29 @@
 package ui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
-func TestMaiaWorkerPicker_ShellHint(t *testing.T) {
+func TestMaiaWorkerPicker_Hints(t *testing.T) {
 	p := &MaiaWorkerPicker{
 		visible: true,
-		workers: []string{"/r/MAIA.worker-1"},
-		width:   80,
-		height:  24,
+		width:   120,
+		height:  30,
 	}
 	view := p.View()
-	if !strings.Contains(view, "s shell") {
-		t.Errorf("picker hint should advertise the raw-shell option; got:\n%s", view)
+	// The primary action is a fresh ad-hoc worktree — no worker pool to browse.
+	if !strings.Contains(view, "new worktree") {
+		t.Errorf("picker should advertise the new-worktree action; got:\n%s", view)
 	}
-	if !strings.Contains(view, "tool") {
-		t.Errorf("picker hint should advertise the tool switcher; got:\n%s", view)
-	}
-	if !strings.Contains(view, "~ home") {
-		t.Errorf("picker hint should advertise the home-root option; got:\n%s", view)
+	for _, hint := range []string{"s shell", "~ home", "c conductor", "r ro-dev", "R remote", "Tab tool"} {
+		if !strings.Contains(view, hint) {
+			t.Errorf("picker hint should advertise %q; got:\n%s", hint, view)
+		}
 	}
 	// The tool switcher names both tools.
 	if !strings.Contains(view, "Claude") || !strings.Contains(view, "Codex") {
@@ -47,43 +48,43 @@ func TestMaiaWorkerPicker_ToggleTool(t *testing.T) {
 	}
 }
 
-func TestMaiaWorkerPicker_NextOpenWorker(t *testing.T) {
-	w := []string{"/r/MAIA.worker-1", "/r/MAIA.worker-2", "/r/MAIA.worker-3"}
-
-	// worker-1 occupied -> next open is index 1 (worker-2).
-	p := &MaiaWorkerPicker{workers: w, occupied: map[string]bool{"/r/MAIA.worker-1": true}}
-	if got := p.nextOpenWorker(); got != 1 {
-		t.Errorf("nextOpenWorker = %d, want 1", got)
+func TestNewWorktreeSpec(t *testing.T) {
+	name, worktreePath, branch, err := NewWorktreeSpec(nil, maiaWorkerGroup)
+	if err != nil {
+		t.Fatalf("NewWorktreeSpec error: %v", err)
 	}
-
-	// none occupied -> index 0.
-	p = &MaiaWorkerPicker{workers: w, occupied: map[string]bool{}}
-	if got := p.nextOpenWorker(); got != 0 {
-		t.Errorf("nextOpenWorker (none occupied) = %d, want 0", got)
+	if name == "" {
+		t.Fatal("NewWorktreeSpec returned empty name")
 	}
-
-	// all occupied -> fall back to 0.
-	p = &MaiaWorkerPicker{workers: w, occupied: map[string]bool{
-		"/r/MAIA.worker-1": true, "/r/MAIA.worker-2": true, "/r/MAIA.worker-3": true,
-	}}
-	if got := p.nextOpenWorker(); got != 0 {
-		t.Errorf("nextOpenWorker (all occupied) = %d, want 0", got)
+	if want := filepath.Join(maiaReposDir, "MAIA."+name); worktreePath != want {
+		t.Errorf("worktreePath = %q, want %q", worktreePath, want)
+	}
+	if want := maiaAdhocBranchPrefix + name; branch != want {
+		t.Errorf("branch = %q, want %q", branch, want)
+	}
+	// A fresh spec must not point at a directory that already exists — a stale
+	// dir from an interrupted teardown must never be silently reused.
+	if _, statErr := os.Stat(worktreePath); !os.IsNotExist(statErr) {
+		t.Errorf("worktreePath %q already exists on disk", worktreePath)
+	}
+	// The generated name must be unique against live instances too (the
+	// generator's contract) — sanity-check by passing an instance holding the
+	// same name and confirming a different one comes back.
+	inst := &session.Instance{Title: name, GroupPath: maiaWorkerGroup}
+	name2, _, _, err := NewWorktreeSpec([]*session.Instance{inst}, maiaWorkerGroup)
+	if err != nil {
+		t.Fatalf("NewWorktreeSpec (collision) error: %v", err)
+	}
+	if name2 == name {
+		t.Errorf("NewWorktreeSpec reused a live session name %q", name)
 	}
 }
 
-func TestMaiaWorkerPicker_Selected(t *testing.T) {
-	p := &MaiaWorkerPicker{
-		workers:      []string{"/r/MAIA.worker-1", "/r/MAIA.worker-2"},
-		roDevs:       []string{"/r/MAIA.ro-dev"},
-		workerCursor: 1,
-	}
+func TestMaiaWorkerPicker_RoDevSelected(t *testing.T) {
+	p := &MaiaWorkerPicker{roDevs: []string{"/r/MAIA.ro-dev"}}
 
-	if path, group := p.Selected(); path != "/r/MAIA.worker-2" || group != maiaWorkerGroup {
-		t.Errorf("worker Selected = (%q, %q), want (worker-2, %q)", path, group, maiaWorkerGroup)
-	}
-
-	// RoDevSelected returns the shared ro-dev worktree regardless of the worker
-	// cursor — it's reached by the 'r' hotkey, not by browsing.
+	// RoDevSelected returns the shared ro-dev worktree — reached by the 'r'
+	// hotkey, not by browsing.
 	if path, group := p.RoDevSelected(); path != "/r/MAIA.ro-dev" || group != maiaRoDevGroup {
 		t.Errorf("RoDevSelected = (%q, %q), want (ro-dev, %q)", path, group, maiaRoDevGroup)
 	}
@@ -92,30 +93,6 @@ func TestMaiaWorkerPicker_Selected(t *testing.T) {
 	p.roDevs = nil
 	if path, _ := p.RoDevSelected(); path != "" {
 		t.Errorf("RoDevSelected with no ro-dev = %q, want empty", path)
-	}
-}
-
-func TestMaiaWorkerPicker_Navigation(t *testing.T) {
-	p := &MaiaWorkerPicker{
-		workers: []string{"/r/MAIA.worker-1", "/r/MAIA.worker-2"},
-		roDevs:  []string{"/r/MAIA.ro-dev"},
-	}
-	key := func(t tea.KeyType) tea.KeyMsg { return tea.KeyMsg{Type: t} }
-
-	// Down advances the worker cursor within range.
-	p, _ = p.Update(key(tea.KeyDown))
-	if p.workerCursor != 1 {
-		t.Fatalf("after down, workerCursor = %d, want 1", p.workerCursor)
-	}
-	// Down is clamped at the last worker.
-	p, _ = p.Update(key(tea.KeyDown))
-	if p.workerCursor != 1 {
-		t.Fatalf("workerCursor = %d, want 1 (clamped)", p.workerCursor)
-	}
-	// Up moves back.
-	p, _ = p.Update(key(tea.KeyUp))
-	if p.workerCursor != 0 {
-		t.Fatalf("after up, workerCursor = %d, want 0", p.workerCursor)
 	}
 }
 
@@ -130,18 +107,6 @@ func TestMaiaWorkerPicker_ConductorSelected(t *testing.T) {
 	p.conductors = nil
 	if path, _ := p.ConductorSelected(); path != "" {
 		t.Errorf("ConductorSelected with no conductor = %q, want empty", path)
-	}
-}
-
-func TestMaiaWorkerPicker_ConductorHint(t *testing.T) {
-	p := &MaiaWorkerPicker{
-		visible: true,
-		workers: []string{"/r/MAIA.worker-1"},
-		width:   100,
-		height:  30,
-	}
-	if !strings.Contains(p.View(), "c conductor") {
-		t.Errorf("hint should advertise the conductor hotkey; got:\n%s", p.View())
 	}
 }
 
@@ -180,26 +145,5 @@ func TestParseRemoteLaneID(t *testing.T) {
 	// remote-claude-new with no args -> not enough fields, ok=false (caller skips teardown).
 	if _, _, ok := parseRemoteLaneID("/x/remote-claude-new"); ok {
 		t.Errorf("parseRemoteLaneID with no args ok = true, want false")
-	}
-}
-
-func TestMaiaWorkerPicker_RemoteHint(t *testing.T) {
-	p := &MaiaWorkerPicker{
-		visible: true,
-		workers: []string{"/r/MAIA.worker-1"},
-		width:   120,
-		height:  30,
-	}
-	if !strings.Contains(p.View(), "R remote") {
-		t.Errorf("hint should advertise the remote hotkey; got:\n%s", p.View())
-	}
-}
-
-func TestWorkerSortKey(t *testing.T) {
-	if a, b := workerSortKey("/r/MAIA.worker-2"), workerSortKey("/r/MAIA.worker-10"); a >= b {
-		t.Errorf("worker-2 (%d) should sort before worker-10 (%d)", a, b)
-	}
-	if a, b := workerSortKey("/r/MAIA.worker-9"), workerSortKey("/r/MAIA.worker-retry"); a >= b {
-		t.Errorf("worker-9 (%d) should sort before worker-retry (%d)", a, b)
 	}
 }

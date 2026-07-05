@@ -2225,6 +2225,14 @@ func handleRemove(profile string, args []string) {
 					if !*jsonOutput {
 						fmt.Printf("Warning: failed to remove worktree: %v\n", err)
 					}
+				} else if strings.HasPrefix(inst.WorktreeBranch, "wt/") {
+					// MAIA ad-hoc holding branch (keep the "wt/" literal in
+					// lockstep with ui.maiaAdhocBranchPrefix): disposable by
+					// construction — the destruction hook pushed any
+					// unrecovered work or the removal above would have failed.
+					if dErr := git.DeleteBranch(inst.WorktreeRepoRoot, inst.WorktreeBranch, true); dErr != nil && !*jsonOutput {
+						fmt.Fprintf(os.Stderr, "warn: holding-branch delete failed for %s: %v\n", inst.WorktreeBranch, dErr)
+					}
 				}
 				_ = backend.PruneWorktrees()
 			} else if !*jsonOutput {

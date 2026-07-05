@@ -183,9 +183,11 @@ func RunWorktreeSetupAfterCreate(repoDir, worktreePath string, stdout, stderr io
 // .agent-deck/worktree-destruction.sh may run. The setup hook resolves its
 // timeout at the session layer, but RemoveWorktree (package git) cannot import
 // session without an import cycle, so the destruction hook uses a fixed default.
-// ponytail: fixed 60s, add a [worktree].destruction_timeout_seconds config if a
-// user ever needs to tune it.
-const DefaultWorktreeDestructionTimeout = 60 * time.Second
+// 300s: the hook may push a recovery ref and stop a docker stack (MAIA's
+// `make down`), which routinely exceeds the old 60s; a timeout now ABORTS the
+// removal (see RemoveWorktree), so it must fit the slowest legitimate hook.
+// Add a [worktree].destruction_timeout_seconds config if it ever needs tuning.
+const DefaultWorktreeDestructionTimeout = 300 * time.Second
 
 // FindWorktreeDestructionScript mirrors FindWorktreeSetupScript for the
 // pre-removal hook at <repoDir>/.agent-deck/worktree-destruction.sh.
@@ -205,8 +207,10 @@ func RunWorktreeDestructionScript(scriptPath string, scriptMode os.FileMode, rep
 }
 
 // RunWorktreeDestructionBeforeRemove runs the destruction script (if present)
-// just before a worktree is removed. Failure is non-fatal: removal proceeds
-// regardless, mirroring setup's "hook failure doesn't block the operation".
+// just before a worktree is removed. Unlike the setup hook, failure is FATAL
+// to the removal: RemoveWorktree aborts so a hook that couldn't preserve the
+// worktree's work (recovery commit/push) never lets a --force removal destroy
+// it. Callers see the error and leave the worktree in place for a retry.
 func RunWorktreeDestructionBeforeRemove(repoDir, worktreePath string, stdout, stderr io.Writer, timeout time.Duration) error {
 	scriptPath, scriptMode := FindWorktreeDestructionScript(repoDir)
 	if scriptPath == "" {

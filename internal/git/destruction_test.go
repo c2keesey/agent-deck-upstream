@@ -69,3 +69,31 @@ echo "$AGENT_DECK_REPO_ROOT|$AGENT_DECK_WORKTREE_PATH|$(pwd)" > "$AGENT_DECK_REP
 		t.Errorf("expected worktree removed, stat err = %v", err)
 	}
 }
+
+// TestRemoveWorktree_DestructionScriptFailureAborts pins the fail-safe: a
+// destruction hook that exits nonzero (it could not make the worktree's work
+// recoverable) must abort the removal, leaving the worktree on disk.
+func TestRemoveWorktree_DestructionScriptFailureAborts(t *testing.T) {
+	dir := t.TempDir()
+	createTestRepoForSetup(t, dir)
+
+	scriptDir := filepath.Join(dir, ".agent-deck")
+	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scriptDir, "worktree-destruction.sh"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreePath := filepath.Join(dir, ".worktrees", "protected")
+	if err := CreateWorktree(dir, worktreePath, "protected"); err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+
+	if err := RemoveWorktree(dir, worktreePath, true); err == nil {
+		t.Fatal("expected RemoveWorktree to abort on destruction-hook failure, got nil")
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		t.Errorf("expected worktree left in place after aborted removal, stat err = %v", err)
+	}
+}

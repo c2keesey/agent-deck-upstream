@@ -1,19 +1,35 @@
 package ui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
 // maiaReposDir is the parent directory scanned for MAIA worktrees.
 // Personal fork customization.
 const maiaReposDir = "/Users/c2k/MAIA/Repos"
+
+// maiaMainRepo is the primary MAIA checkout — the repo root that ad-hoc
+// worktrees are created from (git worktree add runs here, and the
+// .agent-deck/worktree-setup.sh / worktree-destruction.sh hooks are read
+// from this directory).
+const maiaMainRepo = "/Users/c2k/MAIA/Repos/MAIA"
+
+// maiaAdhocBranchPrefix namespaces the holding branch every ad-hoc worktree
+// starts on (wt/<session-name>, based off fresh origin/dev by CreateWorktree).
+// The worker's own pipeline (/lfg) checks out its real ck/MAIA-XXXX feature
+// branch inside the worktree; this branch only exists so the worktree has a
+// unique, disposable ref. The destruction hook names its recovery ref after
+// the worktree dir, not this branch.
+const maiaAdhocBranchPrefix = "wt/"
 
 // Groups the picker pins new sessions to, per the user's workflow:
 // workers land in maia/active, read-only dev sessions in maia/read-only-dev.
@@ -69,42 +85,39 @@ func resolveRemoteLane(envLane, envUser string) string {
 	return "remote"
 }
 
-// MaiaWorkerPicker is the new-session picker for MAIA work. It shows a single
-// Workers column: worker worktrees (MAIA.worker-*), with the cursor defaulting
-// to the next OPEN worker — the lowest-numbered worktree with no agent-deck
-// session in it (occupied = any session, regardless of status).
+// MaiaWorkerPicker is the new-session dialog for MAIA work. The old model —
+// browse a fixed pool of MAIA.worker-N worktrees and rotate through free
+// slots — is retired: Enter now creates a FRESH ad-hoc worktree
+// (MAIA.<session-name>, holding branch wt/<session-name> off origin/dev) via
+// agent-deck's native worktree machinery, which runs the MAIA repo's
+// .agent-deck/worktree-setup.sh hook (full dev setup) after git worktree add,
+// and removes the worktree again when the session is deleted (destruction
+// hook makes dirty/unpushed work recoverable first).
 //
-// ↑/↓ (or j/k) move the worker cursor, Enter creates a Claude session in the
-// selected worker. 'r' is a separate hotkey (handled by the caller) that
-// creates a read-only dev session in the shared MAIA.ro-dev worktree directly,
-// without browsing — there is no ro-dev column.
+// The dialog therefore has no worker column: it is a tool switcher plus
+// action hotkeys. 'c' (conductor) and 'r' (ro-dev) still target the shared
+// long-lived worktrees; 'R' creates a remote box ephemeral; 's' creates a
+// fresh worktree with a plain shell instead of a tool.
 type MaiaWorkerPicker struct {
-	visible      bool
-	workers      []string        // worker worktree paths
-	roDevs       []string        // ro-dev worktree paths
-	conductors   []string        // MAIA.conductor worktree paths (personal fork)
-	occupied     map[string]bool // worktree path -> already hosts a session
-	workerCursor int
-	tool         string // active tool the action keys create with ("claude" | "codex")
+	visible    bool
+	roDevs     []string // ro-dev worktree paths
+	conductors []string // MAIA.conductor worktree paths (personal fork)
+	tool       string   // active tool the action keys create with ("claude" | "codex")
 
 	width   int
 	height  int
 	scanErr string
 }
 
-// NewMaiaWorkerPicker constructs an empty picker; worktrees are scanned on
-// each Show() so freshly-created worktrees appear without a restart.
+// NewMaiaWorkerPicker constructs an empty picker; the shared worktrees are
+// scanned on each Show() so freshly-created worktrees appear without a restart.
 func NewMaiaWorkerPicker() *MaiaWorkerPicker { return &MaiaWorkerPicker{} }
 
-// Show opens the picker. occupied maps worktree paths that already host an
-// agent-deck session (any status); the worker cursor parks on the first
-// worktree not in that set.
-func (m *MaiaWorkerPicker) Show(occupied map[string]bool) {
+// Show opens the picker.
+func (m *MaiaWorkerPicker) Show() {
 	m.visible = true
-	m.occupied = occupied
 	m.tool = maiaToolClaude // default to Claude on every open
 	m.refreshWorktrees()
-	m.workerCursor = m.nextOpenWorker()
 }
 
 // Tools the picker can create with. Codex always launches YOLO in the MAIA
@@ -154,13 +167,20 @@ func (m *MaiaWorkerPicker) SetSize(width, height int) {
 	m.height = height
 }
 
-// Selected returns the worker worktree path under the cursor and the group its
-// session should join. Empty path means nothing to create.
-func (m *MaiaWorkerPicker) Selected() (path, group string) {
-	if m.workerCursor >= 0 && m.workerCursor < len(m.workers) {
-		return m.workers[m.workerCursor], maiaWorkerGroup
+// NewWorktreeSpec picks the identity for a fresh ad-hoc worktree session: a
+// generated session name that is unique among live instances AND whose
+// MAIA.<name> directory does not already exist on disk (a stale dir from an
+// interrupted teardown must not be silently reused as if fresh). Returns the
+// session name, the worktree path, and the holding branch.
+func NewWorktreeSpec(instances []*session.Instance, group string) (name, worktreePath, branch string, err error) {
+	for attempt := 0; attempt < 20; attempt++ {
+		name = session.GenerateUniqueSessionName(instances, group)
+		worktreePath = filepath.Join(maiaReposDir, "MAIA."+name)
+		if _, statErr := os.Stat(worktreePath); os.IsNotExist(statErr) {
+			return name, worktreePath, maiaAdhocBranchPrefix + name, nil
+		}
 	}
-	return "", ""
+	return "", "", "", fmt.Errorf("could not find an unused MAIA.<name> directory in %s after 20 attempts", maiaReposDir)
 }
 
 // RoDevSelected returns the shared ro-dev worktree path and group, used by the
@@ -173,26 +193,16 @@ func (m *MaiaWorkerPicker) RoDevSelected() (path, group string) {
 	return "", ""
 }
 
-// Update handles navigation keys (Enter/Esc are handled by the caller).
+// Update handles keys the caller doesn't route (there is no cursor anymore;
+// navigation keys are no-ops).
 func (m *MaiaWorkerPicker) Update(msg tea.KeyMsg) (*MaiaWorkerPicker, tea.Cmd) {
-	switch msg.String() {
-	case "up", "ctrl+p", "k":
-		if m.workerCursor > 0 {
-			m.workerCursor--
-		}
-	case "down", "ctrl+n", "j":
-		if m.workerCursor < len(m.workers)-1 {
-			m.workerCursor++
-		}
-	}
 	return m, nil
 }
 
-// refreshWorktrees scans maiaReposDir, splitting MAIA.worker-* into the left
-// column and MAIA.ro-dev* into the right. Workers sort numerically
-// (worker-2 < worker-10); non-numeric suffixes (worker-retry) sort last.
+// refreshWorktrees scans maiaReposDir for the shared long-lived worktrees the
+// hotkeys target (MAIA.ro-dev*, MAIA.conductor). Ad-hoc worktrees are created
+// on demand, not browsed, so they are not collected here.
 func (m *MaiaWorkerPicker) refreshWorktrees() {
-	m.workers = nil
 	m.roDevs = nil
 	m.conductors = nil
 	m.scanErr = ""
@@ -208,46 +218,16 @@ func (m *MaiaWorkerPicker) refreshWorktrees() {
 		name := e.Name()
 		path := filepath.Join(maiaReposDir, name)
 		switch {
-		case strings.HasPrefix(name, "MAIA.worker-"):
-			m.workers = append(m.workers, path)
 		case name == "MAIA.ro-dev" || strings.HasPrefix(name, "MAIA.ro-dev"):
 			m.roDevs = append(m.roDevs, path)
 		case name == "MAIA.conductor":
 			m.conductors = append(m.conductors, path)
 		}
 	}
-	sort.SliceStable(m.workers, func(i, j int) bool {
-		return workerSortKey(m.workers[i]) < workerSortKey(m.workers[j])
-	})
 	sort.Strings(m.roDevs)
-	if m.workerCursor >= len(m.workers) {
-		m.workerCursor = 0
-	}
 }
 
-// workerSortKey extracts the numeric worker index for ordering; non-numeric
-// suffixes (e.g. "worker-retry") sort last.
-func workerSortKey(path string) int {
-	suffix := strings.TrimPrefix(filepath.Base(path), "MAIA.worker-")
-	if n, err := strconv.Atoi(suffix); err == nil {
-		return n
-	}
-	return 1 << 30
-}
-
-// nextOpenWorker returns the index of the first worker worktree with no
-// session. Falls back to 0 when all are occupied (or there are none).
-func (m *MaiaWorkerPicker) nextOpenWorker() int {
-	for i, p := range m.workers {
-		if !m.occupied[p] {
-			return i
-		}
-	}
-	return 0
-}
-
-// View renders the Workers column, centered. The ro-dev worktree has no column
-// of its own — 'r' creates a ro-dev session directly.
+// View renders the action dialog, centered.
 func (m *MaiaWorkerPicker) View() string {
 	if !m.visible {
 		return ""
@@ -261,10 +241,13 @@ func (m *MaiaWorkerPicker) View() string {
 	if m.scanErr != "" {
 		body = lipgloss.NewStyle().Foreground(ColorRed).Render("⚠ " + m.scanErr)
 	} else {
-		body = m.renderColumn("Workers", m.workers, m.workerCursor, true, true)
+		accent := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+		dim := lipgloss.NewStyle().Foreground(ColorTextDim)
+		body = accent.Render("⏎  new worktree session") + "\n" +
+			dim.Render("   fresh MAIA.<name> off origin/dev · full setup runs")
 	}
 
-	hintText := "↑/↓ pick · Tab tool · Enter worker · c conductor · r ro-dev · R remote · s shell · ~ home · Esc"
+	hintText := "Enter new worktree · Tab tool · c conductor · r ro-dev · R remote · s shell · ~ home · Esc"
 	hint := lipgloss.NewStyle().Foreground(ColorComment).Render(hintText)
 
 	content := lipgloss.JoinVertical(lipgloss.Left, title, "", toolBar, "", body, "", hint)
@@ -273,7 +256,7 @@ func (m *MaiaWorkerPicker) View() string {
 }
 
 // renderToolSwitcher renders the "Tool:  Claude  Codex" selector with the
-// active tool highlighted, so the user can see (and toggle with c/Tab) which
+// active tool highlighted, so the user can see (and toggle with Tab) which
 // tool the action keys will create with.
 func (m *MaiaWorkerPicker) renderToolSwitcher() string {
 	labelStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
@@ -288,56 +271,4 @@ func (m *MaiaWorkerPicker) renderToolSwitcher() string {
 	}
 	return labelStyle.Render("Tool: ") +
 		claude.Render(" Claude ") + "  " + codex.Render(" Codex ")
-}
-
-// renderColumn renders one bordered column. The focused column gets an
-// accent border and a highlighted cursor row; markOpen tags worker rows
-// with an open (●) / busy (·) dot.
-func (m *MaiaWorkerPicker) renderColumn(title string, items []string, cursor int, focused, markOpen bool) string {
-	const colWidth = 22
-
-	headerStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Bold(true)
-	rowStyle := lipgloss.NewStyle().Foreground(ColorText)
-	selStyle := lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent).Bold(true)
-	openStyle := lipgloss.NewStyle().Foreground(ColorGreen)
-	busyStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
-
-	var b strings.Builder
-	b.WriteString(headerStyle.Render(title))
-	b.WriteString("\n")
-
-	if len(items) == 0 {
-		b.WriteString(busyStyle.Render("(none found)"))
-	}
-	for i, p := range items {
-		label := strings.TrimPrefix(filepath.Base(p), "MAIA.")
-		marker := ""
-		if markOpen {
-			if m.occupied[p] {
-				marker = busyStyle.Render(" ·")
-			} else {
-				marker = openStyle.Render(" ●")
-			}
-		}
-		if focused && i == cursor {
-			b.WriteString(selStyle.Render(" " + label + " "))
-		} else {
-			b.WriteString(rowStyle.Render("  " + label))
-		}
-		b.WriteString(marker)
-		if i < len(items)-1 {
-			b.WriteString("\n")
-		}
-	}
-
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		Width(colWidth).
-		Padding(0, 1)
-	if focused {
-		box = box.BorderForeground(ColorAccent)
-	} else {
-		box = box.BorderForeground(ColorBorder)
-	}
-	return box.Render(b.String())
 }

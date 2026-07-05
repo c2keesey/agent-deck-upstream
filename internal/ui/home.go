@@ -8357,26 +8357,26 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return h, nil
 			}
 		}
-		// Mark which worktrees/projects already host a session so the picker can
-		// park on the next open worker / tag busy rows. Occupied = any session,
-		// regardless of status, keyed by absolute project path.
-		occupied := make(map[string]bool)
-		h.instancesMu.RLock()
-		for _, inst := range h.instances {
-			if inst != nil && inst.ProjectPath != "" {
-				occupied[session.ExpandPath(inst.ProjectPath)] = true
-			}
-		}
-		h.instancesMu.RUnlock()
 		// Personal profile gets its own picker (~/Projects + home + optiplex ssh)
-		// instead of the MAIA worker picker.
+		// instead of the MAIA worker picker. It still marks occupied targets
+		// (any session, regardless of status, keyed by absolute project path).
 		if h.profile == "personal" {
+			occupied := make(map[string]bool)
+			h.instancesMu.RLock()
+			for _, inst := range h.instances {
+				if inst != nil && inst.ProjectPath != "" {
+					occupied[session.ExpandPath(inst.ProjectPath)] = true
+				}
+			}
+			h.instancesMu.RUnlock()
 			h.personalPicker.SetSize(h.width, h.height)
 			h.personalPicker.Show(occupied)
 			return h, nil
 		}
+		// The MAIA picker creates ad-hoc worktrees on demand — no pool, no
+		// occupancy to compute.
 		h.maiaWorkerPicker.SetSize(h.width, h.height)
-		h.maiaWorkerPicker.Show(occupied)
+		h.maiaWorkerPicker.Show()
 		return h, nil
 
 	case "a":
@@ -11000,14 +11000,10 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.maiaWorkerPicker.ToggleTool()
 		return h, nil
 	case "enter":
-		// Create with the active tool in the highlighted worker.
+		// Create a fresh ad-hoc worktree session with the active tool.
 		tool := h.maiaWorkerPicker.ActiveTool()
-		selected, group := h.maiaWorkerPicker.Selected()
 		h.maiaWorkerPicker.Hide()
-		if selected == "" {
-			return h, nil
-		}
-		return h, h.createMaiaWorkerSession(selected, group, tool)
+		return h, h.createMaiaAdhocWorktreeSession(tool)
 	case "c":
 		// Conductor: create a session in the MAIA.conductor worktree directly
 		// with the active tool, bypassing the worker column.
@@ -11019,15 +11015,11 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, h.createMaiaWorkerSession(selected, group, tool)
 	case "s":
-		// Raw shell: spawn a plain shell (empty command) in the highlighted
+		// Raw shell: spawn a plain shell (empty command) in a fresh ad-hoc
 		// worktree, independent of the active tool. Mirrors the empty-command
 		// escape hatch the full NewDialog offered before this picker replaced it.
-		selected, group := h.maiaWorkerPicker.Selected()
 		h.maiaWorkerPicker.Hide()
-		if selected == "" {
-			return h, nil
-		}
-		return h, h.createMaiaWorkerSession(selected, group, "")
+		return h, h.createMaiaAdhocWorktreeSession("")
 	case "r":
 		// Read-only dev: create a session in the shared MAIA.ro-dev worktree
 		// directly with the active tool, bypassing the worker column.
@@ -11061,10 +11053,12 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// createMaiaWorkerSession creates a session rooted at the given MAIA worktree
-// path in the given group, running the given command. An empty command yields
-// a plain shell session; "codex" always launches in YOLO mode (the MAIA flow
-// trusts these worktrees, so codex skips approvals + sandbox).
+// createMaiaWorkerSession creates a session rooted at an EXISTING shared MAIA
+// worktree (conductor / ro-dev — the 'c' and 'r' hotkeys) in the given group,
+// running the given command. An empty command yields a plain shell session;
+// "codex" always launches in YOLO mode (the MAIA flow trusts these worktrees,
+// so codex skips approvals + sandbox). Ad-hoc per-task worktrees go through
+// createMaiaAdhocWorktreeSession instead.
 //
 // Naming: both workers and ro-dev get an auto-generated adjective-noun name so
 // the label engine treats them as untitled and shows the dynamic chain
@@ -11106,6 +11100,49 @@ func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.C
 		"",
 		false,     // not auto-named
 		lockTitle, // MAIA workers (non ro-dev group) lock the title
+	)
+}
+
+// createMaiaAdhocWorktreeSession creates a session in a FRESH ad-hoc worktree:
+// MAIA.<session-name> under maiaReposDir, on holding branch wt/<session-name>
+// based off fresh origin/dev (CreateWorktree's #973 behavior). This replaces
+// the old fixed MAIA.worker-N rotation pool. The native worktree path runs the
+// MAIA repo's .agent-deck/worktree-setup.sh hook (deps + env symlinks + docker
+// port slot) before the tool starts, and session delete removes the worktree
+// again after the destruction hook has made any dirty/unpushed work
+// recoverable.
+//
+// Title handling matches the old worker sessions: auto-generated name, locked,
+// so the row shows live activity (branch → pane title → folder) instead of
+// Claude's conversation summary.
+func (h *Home) createMaiaAdhocWorktreeSession(command string) tea.Cmd {
+	// Codex always runs YOLO in the MAIA flow.
+	var toolOptionsJSON json.RawMessage
+	if command == "codex" {
+		yolo := true
+		toolOptionsJSON, _ = session.MarshalToolOptions(&session.CodexOptions{YoloMode: &yolo})
+	}
+
+	h.instancesMu.RLock()
+	name, worktreePath, branch, err := NewWorktreeSpec(h.instances, maiaWorkerGroup)
+	h.instancesMu.RUnlock()
+	if err != nil {
+		return func() tea.Msg { return sessionCreatedMsg{err: err} }
+	}
+
+	return h.createSessionInGroupWithWorktreeAndOptions(
+		name, maiaMainRepo, command,
+		maiaWorkerGroup,
+		worktreePath, maiaMainRepo, branch,
+		false, false, toolOptionsJSON,
+		nil, // no extra claude args
+		"",  // no claude startup query
+		"",  // no explicit model override
+		false, nil,
+		"", "",
+		"",
+		false, // not auto-named
+		true,  // lock the title so live activity stays the label
 	)
 }
 
@@ -11940,6 +11977,7 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	isWorktree := inst.IsWorktree()
 	worktreePath := inst.WorktreePath
 	worktreeRepoRoot := inst.WorktreeRepoRoot
+	worktreeBranch := inst.WorktreeBranch
 	isMultiRepo := inst.IsMultiRepo()
 	multiRepoTempDir := inst.MultiRepoTempDir
 	multiRepoWorktrees := inst.MultiRepoWorktrees
@@ -12003,8 +12041,21 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 			switch removed, err := session.RemoveSessionWorktree(snap); {
 			case err != nil:
 				uiLog.Warn("worktree_remove_err", slog.String("path", worktreePath), slog.String("err", err.Error()))
+				// A destruction-hook abort (work not recoverable) leaves the
+				// worktree on disk deliberately — surface it like a failed box
+				// teardown so the leak (and the preserved work) isn't silent.
+				remoteReclaimErr = fmt.Errorf("worktree %s left in place (teardown failed — check it manually): %v", filepath.Base(worktreePath), err)
 			case !removed:
 				uiLog.Info("worktree_remove_skipped", slog.String("path", worktreePath), slog.String("repo", worktreeRepoRoot), slog.String("reason", "reused or non-linked worktree (#1200 guard)"))
+			case strings.HasPrefix(worktreeBranch, maiaAdhocBranchPrefix):
+				// MAIA ad-hoc holding branch (wt/<name>): disposable by
+				// construction — the destruction hook has already pushed any
+				// unrecovered work (or the removal would have aborted above).
+				// Delete it so unlimited create/delete cycles don't accrete
+				// stale local branches.
+				if dErr := git.DeleteBranch(worktreeRepoRoot, worktreeBranch, true); dErr != nil {
+					uiLog.Warn("maia_adhoc_branch_delete_err", slog.String("branch", worktreeBranch), slog.String("err", dErr.Error()))
+				}
 			}
 		}
 		if isMultiRepo {

@@ -590,9 +590,15 @@ func RemoveWorktree(repoDir, worktreePath string, force bool) error {
 	// Pre-removal hook: run .agent-deck/worktree-destruction.sh while the
 	// worktree still exists. Gated on IsLinkedWorktree so it never fires for
 	// the main working tree (worktree_reuse sessions, #1200) or non-worktree
-	// paths. Non-fatal — removal proceeds even if the script fails.
+	// paths. A FAILING hook aborts the removal: the hook is the last chance to
+	// preserve work before a --force removal destroys it (e.g. the MAIA hook
+	// commits + pushes dirty/unpushed work to a recovery ref and exits nonzero
+	// when the push fails). Leaking a worktree the user can retry is strictly
+	// better than deleting unrecovered work.
 	if IsLinkedWorktree(worktreePath) {
-		_ = RunWorktreeDestructionBeforeRemove(repoDir, worktreePath, os.Stderr, os.Stderr, DefaultWorktreeDestructionTimeout)
+		if hookErr := RunWorktreeDestructionBeforeRemove(repoDir, worktreePath, os.Stderr, os.Stderr, DefaultWorktreeDestructionTimeout); hookErr != nil {
+			return fmt.Errorf("worktree destruction hook failed — leaving %q in place so its work stays recoverable: %w", worktreePath, hookErr)
+		}
 	}
 
 	args := []string{"-C", repoDir, "worktree", "remove"}

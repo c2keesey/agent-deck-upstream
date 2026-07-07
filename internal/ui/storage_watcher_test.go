@@ -98,6 +98,37 @@ func TestStorageWatcher_ExternalChangesStillDetected(t *testing.T) {
 	}
 }
 
+// TestStorageWatcher_ExternalChangeDuringSaveWindowIsDeferredNotLost pins the
+// fix for the post-teardown grouping corruption: an EXTERNAL DB change that
+// lands inside the post-NotifySave ignore window used to be permanently
+// swallowed (lastModified advanced while the notification was suppressed), so
+// the TUI kept rendering its stale in-memory group tree until restart. The
+// change must instead stay pending and fire a reload once the window closes.
+func TestStorageWatcher_ExternalChangeDuringSaveWindowIsDeferredNotLost(t *testing.T) {
+	db := newTestDB(t)
+	watcher, err := NewStorageWatcher(db)
+	require.NoError(t, err)
+	defer watcher.Close()
+
+	watcher.Start()
+
+	// TUI save opens the ignore window…
+	watcher.NotifySave()
+	time.Sleep(10 * time.Millisecond)
+	// …and an external writer (CLI, notify daemon, another process) lands a
+	// change inside it.
+	require.NoError(t, db.Touch())
+
+	// The reload signal must still arrive after the ignore window (3s)
+	// expires — one poll interval (2s) of slack on top.
+	select {
+	case <-watcher.ReloadChannel():
+		// Success: deferred, not lost.
+	case <-time.After(8 * time.Second):
+		t.Fatal("external change during the save ignore window was swallowed; reload never fired")
+	}
+}
+
 // TestStorageWatcher_CrossProfileIsolation verifies that separate SQLite databases
 // for different profiles are naturally isolated (each has its own metadata).
 func TestStorageWatcher_CrossProfileIsolation(t *testing.T) {

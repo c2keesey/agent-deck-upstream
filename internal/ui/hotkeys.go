@@ -52,7 +52,6 @@ const (
 	// Local fork additions.
 	hotkeyMRUCycle       = "mru_cycle"
 	hotkeyAttentionCycle = "attention_cycle"
-	hotkeyTeardown       = "teardown"
 	// Session switcher. While attached it is intercepted in the tmux attach
 	// loop (see internal/tmux/pty.go AttachOptions); on the home screen it is
 	// dispatched like any other hotkey. Must resolve to a "ctrl+<letter>" chord.
@@ -109,19 +108,21 @@ var hotkeyActionOrder = []string{
 	hotkeyMRUCycle,
 	hotkeyAttentionCycle,
 	hotkeyWatcherPanel,
-	hotkeyTeardown,
 	hotkeySwitchSession,
 }
 
 // defaultHotkeyBindings keeps the local fork keymap as the source of truth
-// (the user relies on this muscle memory: teardown=y, attention=ctrl+e,
-// mru=ctrl+w, hard_restart=ctrl+t, restart=t, settings=p, quick_create=a, …).
+// (the user relies on this muscle memory: attention=ctrl+e, mru=ctrl+w,
+// hard_restart=ctrl+t, restart=t, settings=p, quick_create=a, …).
 // Upstream's v1.9.x keybinding overhaul (restart→R, close→D, move→M, settings→S,
 // toggle_yolo→y, quick_create→N, etc.) is intentionally NOT adopted. Upstream's
 // genuinely-new actions are grafted onto free keys when their upstream default
 // collides with a local binding: cycle_group_view→V (upstream t=restart),
 // worktree_setup→B (upstream b=exec_shell), quick_approve→ctrl+a (upstream
-// a=quick_create). toggle_yolo stays unbound (upstream y=teardown).
+// a=quick_create). toggle_yolo stays unbound (the former teardown key "y" is
+// deliberately left free — teardown now rides the delete flow on "d" for MAIA
+// worktree sessions, and giving "y" a new destructive meaning would fight
+// muscle memory).
 var defaultHotkeyBindings = map[string]string{
 	hotkeyQuit:             "q",
 	hotkeyNewSession:       "n",
@@ -145,7 +146,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyMarkUnread:       "u",
 	hotkeyQuickApprove:     "ctrl+a", // local: 'a' is quick-create; user runs bypass-permissions so approve is parked off the home row
 	hotkeyPromptSession:    "O",      // upstream #1410 defaults this to "o", which collides with local move_to_group; remapped to shift+O (pairs with lowercase o)
-	hotkeyToggleYolo:       "",       // upstream "y" collides with local teardown
+	hotkeyToggleYolo:       "",       // stays unbound; "y" is intentionally left free (ex-teardown key)
 	hotkeyQuickFork:        "f",
 	hotkeyForkWithOptions:  "z",
 	hotkeyCopyOutput:       "c",
@@ -168,7 +169,6 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyMRUCycle:       "",
 	hotkeyAttentionCycle: "ctrl+e",
 	hotkeyWatcherPanel:   "",
-	hotkeyTeardown:       "y",
 	// switch_session = ctrl+w (local remap). Upstream defaults this to Ctrl+S,
 	// but Ctrl+S is XOFF / what some terminals send for Cmd+Right, so it kept
 	// triggering unexpectedly. Ctrl+W is the user's old MRU key and the switcher

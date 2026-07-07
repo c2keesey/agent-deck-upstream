@@ -211,7 +211,6 @@ func (h *HelpOverlay) View() string {
 	viewArchivedKey := h.key(hotkeyViewArchived, "^")
 	mruKey := h.key(hotkeyMRUCycle, "Ctrl+W")
 	attentionKey := h.key(hotkeyAttentionCycle, "Ctrl+E")
-	teardownKey := h.key(hotkeyTeardown, "y")
 
 	sections := []struct {
 		title string
@@ -254,8 +253,7 @@ func (h *HelpOverlay) View() string {
 				{restartKey, "Restart session"},
 				{hardRestartKey, "Hard restart (fresh session)"},
 				{restartFreshKey, "Restart with new session ID"},
-				{teardownKey, "Teardown (gr + make down, then delete)"},
-				{deleteKey, "Delete session"},
+				{deleteKey, "Delete session (MAIA worktree: gr + make down first)"},
 				{closeKey, "Close session process"},
 				{undoKey, "Undo delete"},
 				{archiveKey, "Archive session"},

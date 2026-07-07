@@ -29,6 +29,11 @@ const (
 	ConfirmArchiveSession
 	ConfirmUnarchiveSession
 	ConfirmNotice // acknowledge-only message (single OK button), e.g. protected-action blocks
+	// ConfirmTeardownSession is the MAIA-worktree variant of delete ('d' on a
+	// session whose worktree is a disposable MAIA.<name> checkout): confirm
+	// runs `gr` + `make down` in the worktree, then deletes the session.
+	// (local fork)
+	ConfirmTeardownSession
 )
 
 // ConfirmDialog handles confirmation for destructive actions
@@ -82,6 +87,18 @@ func (c *ConfirmDialog) ShowDeleteSession(sessionID string, sessionName string, 
 	c.targetName = sessionName
 	c.sandboxed = sandboxed
 	c.worktree = worktree
+	c.buttonCount = 2
+	c.focusedButton = 1 // default to Cancel
+}
+
+// ShowTeardownSession shows confirmation for the MAIA teardown flavor of
+// delete: reset the worktree (`gr`), stop its docker stack (`make down`),
+// then delete the session. (local fork)
+func (c *ConfirmDialog) ShowTeardownSession(sessionID string, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmTeardownSession
+	c.targetID = sessionID
+	c.targetName = sessionName
 	c.buttonCount = 2
 	c.focusedButton = 1 // default to Cancel
 }
@@ -345,6 +362,20 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
+
+	case ConfirmTeardownSession:
+		title = "⚠  Teardown MAIA Worktree?"
+		warning = fmt.Sprintf("This will tear down and delete the session:\n\n  \"%s\"", c.targetName)
+		details = "• `gr` resets the worktree to origin/dev\n" +
+			"• `make down` stops the worktree's docker stack\n" +
+			"• The session is then deleted (worktree removed)\n" +
+			"• Cleanup runs in the background; the session stays\n  listed until it finishes"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Teardown", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render("y teardown · n cancel · ←/→ navigate · Enter select · Esc"))
 
 	case ConfirmArchiveSession:
 		title = "Archive Session?"

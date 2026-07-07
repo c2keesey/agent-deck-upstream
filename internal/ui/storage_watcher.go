@@ -82,12 +82,9 @@ func (sw *StorageWatcher) checkAndNotify() {
 		return
 	}
 
-	sw.modMu.Lock()
+	sw.modMu.RLock()
 	changed := ts > sw.lastModified
-	if changed {
-		sw.lastModified = ts
-	}
-	sw.modMu.Unlock()
+	sw.modMu.RUnlock()
 
 	if !changed {
 		return
@@ -96,14 +93,31 @@ func (sw *StorageWatcher) checkAndNotify() {
 	// Check if we should ignore this change (TUI's own save).
 	// The ignore window must be >= pollInterval so a self-triggered change
 	// is always caught on the first poll after the save.
+	//
+	// CRITICAL: when suppressing, lastModified must NOT advance. It used to,
+	// which permanently swallowed any EXTERNAL change that landed inside the
+	// 3s window after a TUI save — the reload never fired, the TUI kept
+	// rendering its stale in-memory group tree (sessions under old/wrong
+	// groups) while the DB was correct, and only a restart healed it. Busy
+	// decks (status persists every few seconds, each re-arming the window)
+	// could chain blind windows for minutes — the post-teardown grouping
+	// corruption. By leaving lastModified untouched, a suppressed change
+	// stays pending: the first poll after the window closes sees ts >
+	// lastModified and fires the reload. Self-saves cost at most one
+	// consolidating (no-op) reload once the deck quiesces; external changes
+	// are now merely delayed, never lost.
 	sw.saveMu.RLock()
 	lastSave := sw.lastSaveTime
 	sw.saveMu.RUnlock()
 
 	if time.Since(lastSave) < ignoreWindow {
-		watcherLog.Debug("watcher_ignoring_own_save")
+		watcherLog.Debug("watcher_deferring_change_during_save_window")
 		return
 	}
+
+	sw.modMu.Lock()
+	sw.lastModified = ts
+	sw.modMu.Unlock()
 
 	watcherLog.Debug("watcher_db_changed", slog.Int64("timestamp", ts))
 

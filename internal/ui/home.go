@@ -904,6 +904,12 @@ type loadSessionsMsg struct {
 	poolProxies  int          // Number of socket proxies started
 	poolError    error        // Pool initialization error
 	loadMtime    time.Time    // File mtime at load time (for external change detection)
+	// reloadVersion stamps a watcher-triggered reload with the value of
+	// h.reloadVersion at dispatch time. The handler drops the message when it
+	// no longer matches — an older DB snapshot must never apply after a newer
+	// one (see the loadSessionsMsg staleness guard). 0 = unversioned load
+	// (initial load, manual ctrl+r) which always applies.
+	reloadVersion uint64
 }
 
 type sessionCreatedMsg struct {
@@ -4861,6 +4867,27 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, h.fetchPreview(inst, key, winIdx)
 
 	case loadSessionsMsg:
+		// Staleness guard: watcher-triggered reloads are dispatched one async
+		// DB-read cmd per storageChangedMsg, and bubbletea gives NO ordering
+		// guarantee between in-flight cmds. Without this check an OLDER DB
+		// snapshot could apply after a newer one, rebuilding h.instances /
+		// instanceByID / groupTree / flatItems from stale data — sessions
+		// rendered under old groups and torn-down sessions resurrected while
+		// the DB was correct (the post-teardown grouping corruption). Only
+		// the snapshot matching the latest dispatched version may apply; a
+		// dropped stale snapshot leaves isReloading for the newer in-flight
+		// reload to clear. Unversioned loads (initial load, manual ctrl+r)
+		// carry 0 and always apply.
+		if msg.reloadVersion != 0 {
+			h.reloadMu.Lock()
+			stale := msg.reloadVersion != h.reloadVersion
+			h.reloadMu.Unlock()
+			if stale {
+				uiLog.Debug("reload_skip_stale_snapshot",
+					slog.Uint64("snapshot_version", msg.reloadVersion))
+				return h, nil
+			}
+		}
 		// Clear loading indicators and store file mtime for external change detection
 		h.reloadMu.Lock()
 		h.isReloading = false
@@ -5243,13 +5270,22 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case sessionDeletedMsg:
-		// CRITICAL FIX: Skip processing during reload to prevent state corruption
+		// Defer processing during reload to prevent state corruption — but
+		// REQUEUE rather than drop. By the time this message arrives the
+		// delete cmd has already run its irreversible side effects (tmux
+		// killed, worktree removed, branch deleted); dropping it left the DB
+		// row behind, so the in-flight reload resurrected the session as a
+		// zombie. This bit teardown especially: its result lands minutes
+		// after the keypress, at an uncorrelated moment when a reload is
+		// often in flight. The reload window is sub-second, so a short tick
+		// retry loop converges quickly.
 		h.reloadMu.Lock()
 		reloading := h.isReloading
 		h.reloadMu.Unlock()
 		if reloading {
-			uiLog.Debug("reload_skip_session_deleted")
-			return h, nil
+			uiLog.Debug("reload_requeue_session_deleted", slog.String("id", msg.deletedID))
+			requeued := msg
+			return h, tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return requeued })
 		}
 
 		// Report kill error if any (session may still be running in tmux)
@@ -5731,6 +5767,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.reloadMu.Lock()
 		h.isReloading = true
 		h.reloadVersion++
+		version := h.reloadVersion
 		h.reloadMu.Unlock()
 
 		// Preserve UI state before reload
@@ -5748,6 +5785,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				err:          err,
 				restoreState: &state, // Pass state to restore after load
 				loadMtime:    loadMtime,
+				// Stamped so the handler can drop this snapshot if a newer
+				// reload was dispatched while this one's DB read was in
+				// flight (out-of-order application corrupted the in-memory
+				// group tree — the post-teardown "wrong groups" bug).
+				reloadVersion: version,
 			}
 		}
 
@@ -8397,7 +8439,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
-				h.confirmDialog.ShowDeleteSession(item.Session.ID, item.Session.Title, item.Session.IsSandboxed(), item.Session.IsWorktree())
+				if isMaiaTeardownSession(item.Session) {
+					// Disposable MAIA worktree: 'd' runs the full teardown flow
+					// (gr + make down in the worktree, then delete) behind its
+					// own confirmation. Replaces the former 'y' hotkey.
+					h.confirmDialog.ShowTeardownSession(item.Session.ID, item.Session.Title)
+				} else {
+					h.confirmDialog.ShowDeleteSession(item.Session.ID, item.Session.Title, item.Session.IsSandboxed(), item.Session.IsWorktree())
+				}
 			} else if item.Type == session.ItemTypeRemoteSession && item.RemoteSession != nil {
 				h.confirmDialog.ShowDeleteRemoteSession(item.RemoteName, item.RemoteSession.ID, item.RemoteSession.Title)
 			} else if item.Type == session.ItemTypeGroup && item.Path == session.DefaultGroupPath {
@@ -8586,18 +8635,6 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.syncViewport()
 		h.saveUIState()
 		return h, h.fetchSelectedPreview()
-
-	case "y":
-		// Teardown: run `gr` (reset worktree) + `make down` (stop docker) directly
-		// in the worktree, tool-agnostically, then delete the session.
-		if h.cursor < len(h.flatItems) {
-			item := h.flatItems[h.cursor]
-			if item.Type == session.ItemTypeSession && item.Session != nil {
-				h.setError(fmt.Errorf("Tearing down '%s' (gr + make down)…", item.Session.Title))
-				return h, h.teardownSession(item.Session)
-			}
-		}
-		return h, nil
 
 	case "t":
 		// Restart session (recreate tmux session with resume)
@@ -9023,6 +9060,16 @@ func (h *Home) confirmAction() tea.Cmd {
 		if inst := h.getInstanceByID(sessionID); inst != nil {
 			h.confirmDialog.Hide()
 			return h.deleteSession(inst)
+		}
+	case ConfirmTeardownSession:
+		// MAIA teardown flavor of delete: run `gr` (reset worktree) + `make
+		// down` (stop docker) directly in the worktree, tool-agnostically,
+		// then delete the session (teardownResultMsg → deleteSession).
+		sessionID := h.confirmDialog.GetTargetID()
+		if inst := h.getInstanceByID(sessionID); inst != nil {
+			h.confirmDialog.Hide()
+			h.setError(fmt.Errorf("Tearing down '%s' (gr + make down)…", inst.Title))
+			return h.teardownSession(inst)
 		}
 	case ConfirmCloseSession:
 		sessionID := h.confirmDialog.GetTargetID()

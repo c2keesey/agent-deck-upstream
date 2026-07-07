@@ -54,6 +54,42 @@ const maiaRemoteScript = "/Users/c2k/repos/agent-deck/scripts/remote-claude-new"
 // don't leak. Self-contained sibling of remote-claude-new in this repo's scripts/.
 const maiaReclaimBoxScript = "/Users/c2k/repos/agent-deck/scripts/remote-reclaim-box"
 
+// isMaiaTeardownWorktree reports whether dir is a disposable MAIA worktree —
+// a MAIA.<name> checkout directly under maiaReposDir (ad-hoc picker worktrees
+// like MAIA.risen-lotus, legacy MAIA.worker-N, named ones like MAIA.cc-review).
+// The shared long-lived checkouts are excluded: the MAIA repo itself,
+// MAIA.conductor, and MAIA.ro-dev* must never be `gr`-reset by a plain 'd'
+// press. Pure string logic (no disk access) so it is safe on every keypress
+// and in tests. (local fork)
+func isMaiaTeardownWorktree(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	dir = filepath.Clean(dir)
+	if filepath.Dir(dir) != maiaReposDir {
+		return false
+	}
+	base := filepath.Base(dir)
+	if !strings.HasPrefix(base, "MAIA.") {
+		return false
+	}
+	if base == "MAIA.conductor" || strings.HasPrefix(base, "MAIA.ro-dev") {
+		return false
+	}
+	return true
+}
+
+// isMaiaTeardownSession reports whether the session lives in a disposable MAIA
+// worktree (see isMaiaTeardownWorktree), checking both the effective working
+// dir and the recorded worktree path. Such sessions get the teardown flavor of
+// 'd' (gr + make down, then delete) instead of a plain delete. (local fork)
+func isMaiaTeardownSession(inst *session.Instance) bool {
+	if inst == nil {
+		return false
+	}
+	return isMaiaTeardownWorktree(inst.EffectiveWorkingDir()) || isMaiaTeardownWorktree(inst.WorktreePath)
+}
+
 // parseRemoteLaneID extracts the lane and ephemeral id from a remote session's stored
 // command (`…/remote-claude-new <lane> <id> [model]`), so the delete hook can target
 // the right box worktree. ok is false when the command isn't a remote-claude-new

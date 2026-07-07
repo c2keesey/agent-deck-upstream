@@ -263,32 +263,91 @@ func (m *MaiaWorkerPicker) refreshWorktrees() {
 	sort.Strings(m.roDevs)
 }
 
-// View renders the action dialog, centered.
+// View renders the action dialog, centered. Layout: title/subtitle, tool
+// switcher, a bordered card for the primary action (Enter → fresh worktree),
+// then the secondary hotkeys as an aligned key/label/description list — so
+// the one action that matters most (create) reads as the headline and the
+// shortcuts read as a reference table underneath it, instead of one flat
+// paragraph.
 func (m *MaiaWorkerPicker) View() string {
 	if !m.visible {
 		return ""
 	}
 
 	title := DialogTitleStyle.Render("New MAIA Session")
+	subtitle := lipgloss.NewStyle().Foreground(ColorComment).
+		Render("ad-hoc worktrees · no pool, no limit")
 
 	toolBar := m.renderToolSwitcher()
+	toolHint := lipgloss.NewStyle().Foreground(ColorComment).Render("Tab tool · Esc cancel")
 
 	var body string
 	if m.scanErr != "" {
 		body = lipgloss.NewStyle().Foreground(ColorRed).Render("⚠ " + m.scanErr)
 	} else {
-		accent := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
-		dim := lipgloss.NewStyle().Foreground(ColorTextDim)
-		body = accent.Render("⏎  new worktree session") + "\n" +
-			dim.Render("   fresh MAIA.<name> off origin/dev · full setup runs")
+		body = m.renderPrimaryAction()
 	}
 
-	hintText := "Enter new worktree · Tab tool · c conductor · r ro-dev · R remote · s shell · ~ home · Esc"
-	hint := lipgloss.NewStyle().Foreground(ColorComment).Render(hintText)
+	actionsLabel := lipgloss.NewStyle().Foreground(ColorComment).Render("or jump straight to")
+	actions := m.renderSecondaryActions()
 
-	content := lipgloss.JoinVertical(lipgloss.Left, title, "", toolBar, "", body, "", hint)
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		title, subtitle, "",
+		toolBar, toolHint, "",
+		body, "",
+		actionsLabel, actions,
+	)
 	dialog := DialogBoxStyle.Render(content)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+}
+
+// renderPrimaryAction renders the headline Enter action as a bordered card,
+// visually distinct from the secondary hotkeys below it — it's the thing
+// most keystrokes in this dialog are for.
+func (m *MaiaWorkerPicker) renderPrimaryAction() string {
+	accent := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+	dim := lipgloss.NewStyle().Foreground(ColorTextDim)
+
+	inner := lipgloss.JoinVertical(lipgloss.Left,
+		accent.Render("⏎  new worktree"),
+		dim.Render("fresh MAIA.<name> off origin/dev"),
+		dim.Render("full dev setup runs automatically"),
+	)
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorAccent).
+		Padding(0, 2).
+		Render(inner)
+}
+
+// maiaSecondaryAction is one row in the hotkey reference table below the
+// primary action card.
+type maiaSecondaryAction struct{ key, label, desc string }
+
+var maiaSecondaryActions = []maiaSecondaryAction{
+	{"c", "conductor", "shared conductor worktree"},
+	{"r", "ro-dev", "shared read-only worktree"},
+	{"R", "remote", "ephemeral session on the dev box"},
+	{"s", "shell", "fresh worktree, plain shell"},
+	{"~", "home", "plain shell at ~, no worktree"},
+}
+
+// renderSecondaryActions renders the non-Enter hotkeys as an aligned
+// key/label + description table so the mapping from key to destination is
+// scannable at a glance instead of a run-on sentence. The key and label are
+// rendered as a single styled unit (not two separate Render calls) so the
+// dialog stays narrow — a per-fragment style would force column-padding
+// space between them, widening every row for no visual benefit.
+func (m *MaiaWorkerPicker) renderSecondaryActions() string {
+	const keyLabelWidth = 13 // widest entry, "c conductor", plus a little air
+	keyLabelStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true).Width(keyLabelWidth)
+	descStyle := lipgloss.NewStyle().Foreground(ColorComment)
+
+	rows := make([]string, len(maiaSecondaryActions))
+	for i, a := range maiaSecondaryActions {
+		rows[i] = keyLabelStyle.Render(a.key+" "+a.label) + descStyle.Render(a.desc)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
 // renderToolSwitcher renders the "Tool:  Claude  Codex" selector with the

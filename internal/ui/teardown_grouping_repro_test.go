@@ -118,6 +118,102 @@ func TestSessionDeletedDuringReload_RequeuedNotDropped(t *testing.T) {
 	}
 }
 
+// TestReloadSnapshotDoesNotResurrectDeletedSession pins the fix for the
+// persistent "stopped but never leaves" zombie seen after a MAIA teardown ('d').
+// A reload whose DB snapshot was captured BEFORE the delete's DB write still
+// carries the torn-down session. Applying that version-current snapshot AFTER
+// sessionDeletedMsg removed the row used to resurrect it — and permanently,
+// because the delete's own DB write lands inside the storage watcher's
+// self-write ignore window so no healing reload ever fires (only a manual
+// ctrl+r/restart cleared it). A tombstone must filter the deleted id out of any
+// reload snapshot until the DB catches up (the snapshot no longer lists it).
+func TestReloadSnapshotDoesNotResurrectDeletedSession(t *testing.T) {
+	home := newGroupedTeardownHome(t, t.TempDir())
+
+	// Snapshot the pre-delete instance list (still contains a2), stamped with
+	// the reloadVersion an in-flight reload would carry so the staleness guard
+	// does NOT drop it — this is the dangerous version-current case.
+	home.reloadMu.Lock()
+	home.reloadVersion++
+	version := home.reloadVersion
+	home.reloadMu.Unlock()
+	snapshot := make([]*session.Instance, len(home.instances))
+	copy(snapshot, home.instances)
+
+	// Delete a2: row removed from memory + DB, tombstone recorded.
+	model, _ := home.Update(sessionDeletedMsg{deletedID: "a2"})
+	home = model.(*Home)
+	if _, still := home.instanceByID["a2"]; still {
+		t.Fatalf("a2 must be removed by sessionDeletedMsg")
+	}
+
+	// The in-flight reload's stale-but-version-current snapshot lands.
+	model, _ = home.Update(loadSessionsMsg{instances: snapshot, reloadVersion: version})
+	home = model.(*Home)
+
+	if _, back := home.instanceByID["a2"]; back {
+		t.Fatalf("deleted session resurrected by a stale reload snapshot")
+	}
+	if strings.Contains(dumpListStructure(home), "a2") {
+		t.Fatalf("resurrected zombie present in tree/flatItems:\n%s", dumpListStructure(home))
+	}
+
+	// Once the DB catches up (snapshot no longer lists a2), the tombstone must
+	// clear so it can't shadow a genuinely-present future session.
+	freshSnap := []*session.Instance{home.instanceByID["a1"], home.instanceByID["b1"]}
+	home.reloadMu.Lock()
+	home.reloadVersion++
+	v2 := home.reloadVersion
+	home.reloadMu.Unlock()
+	model, _ = home.Update(loadSessionsMsg{instances: freshSnap, reloadVersion: v2})
+	home = model.(*Home)
+	home.reloadMu.Lock()
+	_, stillTombstoned := home.deletedIDs["a2"]
+	home.reloadMu.Unlock()
+	if stillTombstoned {
+		t.Fatalf("tombstone for a2 must clear once the DB no longer lists it")
+	}
+}
+
+// TestUndoDeleteClearsTombstone guards the tombstone against re-hiding a
+// legitimately restored session: undo (ctrl+z) resurrects a deleted id on
+// purpose, so its tombstone must lift or the very next reload snapshot (which
+// now lists the restored id) would filter it straight back out.
+func TestUndoDeleteClearsTombstone(t *testing.T) {
+	home := newGroupedTeardownHome(t, t.TempDir())
+	restored := home.instanceByID["a2"]
+
+	// Delete then undo-restore a2.
+	model, _ := home.Update(sessionDeletedMsg{deletedID: "a2"})
+	home = model.(*Home)
+	home.reloadMu.Lock()
+	_, tombstoned := home.deletedIDs["a2"]
+	home.reloadMu.Unlock()
+	if !tombstoned {
+		t.Fatalf("delete must tombstone a2")
+	}
+	model, _ = home.Update(sessionRestoredMsg{instance: restored})
+	home = model.(*Home)
+	home.reloadMu.Lock()
+	_, stillTombstoned := home.deletedIDs["a2"]
+	home.reloadMu.Unlock()
+	if stillTombstoned {
+		t.Fatalf("undo-restore must clear the a2 tombstone")
+	}
+
+	// A reload snapshot that lists the restored a2 must keep it, not filter it.
+	snap := []*session.Instance{home.instanceByID["a1"], restored, home.instanceByID["b1"]}
+	home.reloadMu.Lock()
+	home.reloadVersion++
+	v := home.reloadVersion
+	home.reloadMu.Unlock()
+	model, _ = home.Update(loadSessionsMsg{instances: snap, reloadVersion: v})
+	home = model.(*Home)
+	if _, ok := home.instanceByID["a2"]; !ok {
+		t.Fatalf("restored session must survive the next reload, not be re-hidden")
+	}
+}
+
 // TestTeardownDelete_GroupingMatchesPlainDelete is a regression test for the
 // grouping corruption seen after the old `y` teardown: the teardown-flavored
 // delete (d on a MAIA worktree session → confirm → gr/make down → delete) must

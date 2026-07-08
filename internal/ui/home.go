@@ -297,13 +297,20 @@ type Home struct {
 	previewMode         PreviewMode             // What to show in preview pane (both, output-only, analytics-only)
 	groupViewMode       session.GroupViewMode   // List partition: normal, active-on-top, populated-on-top (cycled by hotkey 't')
 	err                 error
-	errTime             time.Time  // When error occurred (for auto-dismiss)
-	isReloading         bool       // Visual feedback during auto-reload
-	initialLoading      bool       // True until first loadSessionsMsg received (shows splash screen)
-	isQuitting          bool       // True when user pressed q, shows quitting splash
-	reloadVersion       uint64     // Incremented on each reload to prevent stale background saves
-	reloadMu            sync.Mutex // Protects reloadVersion, isReloading, and lastLoadMtime for thread-safe access
-	lastLoadMtime       time.Time  // File mtime when we last loaded (for external change detection)
+	errTime             time.Time // When error occurred (for auto-dismiss)
+	isReloading         bool      // Visual feedback during auto-reload
+	initialLoading      bool      // True until first loadSessionsMsg received (shows splash screen)
+	isQuitting          bool      // True when user pressed q, shows quitting splash
+	reloadVersion       uint64    // Incremented on each reload to prevent stale background saves
+	// deletedIDs tombstones sessions removed via sessionDeletedMsg so a reload
+	// whose DB snapshot was captured before the delete's DB write cannot
+	// resurrect them (the "stopped but never leaves" zombie after teardown). An
+	// id is filtered out of every reload snapshot until the snapshot itself no
+	// longer lists it (the DB caught up), at which point the tombstone clears.
+	// Guarded by reloadMu — same reload-coordination scope.
+	deletedIDs    map[string]struct{}
+	reloadMu      sync.Mutex // Protects reloadVersion, isReloading, deletedIDs, and lastLoadMtime for thread-safe access
+	lastLoadMtime time.Time  // File mtime when we last loaded (for external change detection)
 
 	// Preview cache (async fetching - View() must be pure, no blocking I/O)
 	previewCache      map[string]string    // previewKey -> cached preview content
@@ -1176,6 +1183,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		toolVisibilityPanel:       NewToolVisibilityPanel(),
 		insertBatchDuration:       defaultInsertBatchDuration,
 		insertOpenKeySender:       defaultInsertOpenKeySender,
+		deletedIDs:                make(map[string]struct{}),
 		cursor:                    0,
 		initialLoading:            true, // Show splash until sessions load
 		ctx:                       ctx,
@@ -4888,6 +4896,35 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return h, nil
 			}
 		}
+		// Tombstone filter: drop any session this UI already deleted but whose DB
+		// write hadn't landed when this snapshot's DB read ran (a version-current
+		// snapshot escapes the staleness guard above). Without this the row is
+		// resurrected as a permanent "stopped" zombie — the delete's own DB write
+		// sits inside the storage watcher's self-write ignore window, so no
+		// healing reload follows. A tombstone clears once the snapshot no longer
+		// lists its id (the DB has caught up), so it never shadows a live session.
+		h.reloadMu.Lock()
+		if len(h.deletedIDs) > 0 {
+			snapshotIDs := make(map[string]struct{}, len(msg.instances))
+			for _, inst := range msg.instances {
+				snapshotIDs[inst.ID] = struct{}{}
+			}
+			kept := make([]*session.Instance, 0, len(msg.instances))
+			for _, inst := range msg.instances {
+				if _, dead := h.deletedIDs[inst.ID]; dead {
+					uiLog.Debug("reload_drop_resurrected_session", slog.String("id", inst.ID))
+					continue
+				}
+				kept = append(kept, inst)
+			}
+			msg.instances = kept
+			for id := range h.deletedIDs {
+				if _, present := snapshotIDs[id]; !present {
+					delete(h.deletedIDs, id) // DB caught up — stop filtering it
+				}
+			}
+		}
+		h.reloadMu.Unlock()
 		// Clear loading indicators and store file mtime for external change detection
 		h.reloadMu.Lock()
 		h.isReloading = false
@@ -5297,6 +5334,17 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.setError(msg.remoteReclaimErr)
 		}
 
+		// Tombstone this id (past the reload-requeue early-return above, so a
+		// requeued message doesn't tombstone before the delete is truly applied)
+		// so an in-flight reload snapshot captured before the DB write can't
+		// resurrect it. Cleared in loadSessionsMsg once the DB catches up.
+		h.reloadMu.Lock()
+		if h.deletedIDs == nil {
+			h.deletedIDs = make(map[string]struct{})
+		}
+		h.deletedIDs[msg.deletedID] = struct{}{}
+		h.reloadMu.Unlock()
+
 		// Find and remove from list
 		var deletedInstance *session.Instance
 		h.instancesMu.Lock()
@@ -5423,6 +5471,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.setError(fmt.Errorf("failed to restore session: %w", msg.err))
 			return h, nil
 		}
+
+		// Undo-delete resurrects this id deliberately: lift its tombstone so the
+		// resurrected-session reload filter doesn't re-hide the restored row.
+		h.reloadMu.Lock()
+		delete(h.deletedIDs, msg.instance.ID)
+		h.reloadMu.Unlock()
 
 		// Re-add to instances (mirrors sessionCreatedMsg pattern)
 		h.instancesMu.Lock()

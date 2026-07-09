@@ -854,13 +854,16 @@ func main() {
 	// startup; live sibling TUIs (allow_multiple=true) are preserved.
 	tmux.SweepStaleControlClients(tmux.DefaultSocketName())
 
-	// From here the TUI owns the terminal. Worktree hooks (notably the
-	// destruction hook that runs when a worktree session is deleted) default to
-	// writing their progress and script output to os.Stderr — inside the alt
-	// screen that scrolls the frame and leaves a corrupted, doubled render.
-	// Route them into the structured log instead.
+	// From here the TUI owns the terminal. Anything that writes raw text to
+	// os.Stderr inside the alt screen scrolls the frame and leaves a corrupted,
+	// doubled render. Two such writers default to os.Stderr for CLI use: the
+	// worktree hooks (notably the destruction hook that runs when a worktree
+	// session is deleted) and the macOS plugin-scratch notice banner emitted
+	// during session setup. Route both into the structured log.
 	git.SetHookOutput(logging.NewBridgeWriter("worktree-hook"))
 	defer git.SetHookOutput(nil)
+	session.SetNoticeOutput(logging.NewBridgeWriter("session-notice"))
+	defer session.SetNoticeOutput(nil)
 
 	p := tea.NewProgram(
 		homeModel,

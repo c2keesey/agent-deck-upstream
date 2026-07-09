@@ -848,7 +848,7 @@ func (i *Instance) prepareWorkerScratchConfigDirForSpawn() {
 // macOSScratchWarningEmitter is the package-level seam that lets tests
 // observe and override the warning emission. Real callers go through
 // maybeEmitMacOSScratchWarning which is darwin-gated and state-cached.
-var macOSScratchWarningEmitter func(sourceProfileDir string) = emitMacOSScratchWarningToStderr
+var macOSScratchWarningEmitter func(sourceProfileDir string) = emitMacOSScratchWarning
 
 // maybeEmitMacOSScratchWarning is a no-op on non-darwin and a one-shot
 // per-(host, sourceProfileDir) pair on darwin. Cache lives in
@@ -974,7 +974,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return os.Rename(tmpPath, path)
 }
 
-func emitMacOSScratchWarningToStderr(sourceProfileDir string) {
+func emitMacOSScratchWarning(sourceProfileDir string) {
 	const banner = "" +
 		"┌─ NOTICE: per-session plugin scratch on macOS ──────────────────┐\n" +
 		"│ This session enables plugins via a per-session CLAUDE_CONFIG_DIR. │\n" +
@@ -989,7 +989,7 @@ func emitMacOSScratchWarningToStderr(sourceProfileDir string) {
 		"│                                                                  │\n" +
 		"│ See: docs/rfc/PLUGIN_ATTACH.md §7                                │\n" +
 		"└──────────────────────────────────────────────────────────────────┘\n"
-	fmt.Fprint(os.Stderr, banner)
+	fmt.Fprint(NoticeOutput(), banner)
 	sessionLog.Warn("macos_plugin_scratch_warning_shown",
 		slog.String("source_profile_dir", sourceProfileDir),
 	)

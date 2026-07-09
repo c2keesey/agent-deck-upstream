@@ -10877,6 +10877,12 @@ func (h *Home) quickForkSession(source *session.Instance) tea.Cmd {
 	if source == nil {
 		return nil
 	}
+	// Local fork: forking a MAIA session lands it in a fresh ad-hoc worktree
+	// (the same MAIA.<name> / maia/active / worktree-setup.sh setup a new MAIA
+	// session gets) instead of the generic fork/<slug> worktree.
+	if isMaiaForkSource(source) {
+		return h.quickForkMaiaAdhoc(source)
+	}
 	cfg, _ := session.LoadUserConfig()
 	fork := session.ForkSettings{}
 	if cfg != nil {
@@ -10917,6 +10923,30 @@ func (h *Home) quickForkSession(source *session.Instance) tea.Cmd {
 		return nil
 	}
 	return result.cmd
+}
+
+// quickForkMaiaAdhoc forks a MAIA session into a fresh ad-hoc worktree, reusing
+// the same worktree identity a new MAIA session gets (NewWorktreeSpec →
+// MAIA.<name> off the main repo, maia/active group, .agent-deck/worktree-setup.sh
+// hook) while carrying the parent's conversation through the shared fork
+// machinery. The worktree is created fresh off origin/dev (WithState off), so
+// the fork inherits the parent's context, not its uncommitted files. (local fork)
+func (h *Home) quickForkMaiaAdhoc(source *session.Instance) tea.Cmd {
+	h.instancesMu.RLock()
+	name, worktreePath, branch, err := NewWorktreeSpec(h.instances, maiaWorkerGroup)
+	h.instancesMu.RUnlock()
+	if err != nil {
+		h.setError(err)
+		return nil
+	}
+
+	spec := buildMaiaForkSpec(source, name, worktreePath, branch)
+	return h.forkSessionCmdWithOptions(
+		source, spec.Title, spec.Group, spec.Toggles, spec.Opts,
+		git.WorktreeStateOptions{}, // fresh worktree: no parent WIP materialization
+		source.ParentSessionID, source.ParentProjectPath,
+		"",
+	)
 }
 
 // quickCreateSession creates a session instantly with auto-generated name and smart defaults.

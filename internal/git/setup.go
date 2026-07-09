@@ -8,8 +8,40 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+// hookOutput is the sink for worktree hook progress lines and the hook script's
+// own stdout/stderr. nil means "os.Stderr, resolved at call time" — the right
+// default for CLI commands, where a slow destruction hook should show progress.
+//
+// The TUI owns the terminal: raw writes scroll the Bubble Tea alt-screen and
+// corrupt the frame (duplicate group headers, stray hook lines below the
+// footer). It MUST call SetHookOutput with a non-terminal sink at startup.
+var (
+	hookOutputMu sync.RWMutex
+	hookOutput   io.Writer
+)
+
+// SetHookOutput redirects worktree hook output. Pass nil to restore os.Stderr.
+func SetHookOutput(w io.Writer) {
+	hookOutputMu.Lock()
+	hookOutput = w
+	hookOutputMu.Unlock()
+}
+
+// HookOutput returns the current hook sink, defaulting to os.Stderr. os.Stderr
+// is read at call time so callers (and tests) can swap it.
+func HookOutput() io.Writer {
+	hookOutputMu.RLock()
+	w := hookOutput
+	hookOutputMu.RUnlock()
+	if w == nil {
+		return os.Stderr
+	}
+	return w
+}
 
 // FindWorktreeSetupScript returns the path to the worktree setup script
 // if one exists at <repoDir>/.agent-deck/worktree-setup.sh, or empty string.

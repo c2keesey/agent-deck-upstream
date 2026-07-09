@@ -596,7 +596,8 @@ func RemoveWorktree(repoDir, worktreePath string, force bool) error {
 	// when the push fails). Leaking a worktree the user can retry is strictly
 	// better than deleting unrecovered work.
 	if IsLinkedWorktree(worktreePath) {
-		if hookErr := RunWorktreeDestructionBeforeRemove(repoDir, worktreePath, os.Stderr, os.Stderr, DefaultWorktreeDestructionTimeout); hookErr != nil {
+		out := HookOutput()
+		if hookErr := RunWorktreeDestructionBeforeRemove(repoDir, worktreePath, out, out, DefaultWorktreeDestructionTimeout); hookErr != nil {
 			return fmt.Errorf("worktree destruction hook failed — leaving %q in place so its work stays recoverable: %w", worktreePath, hookErr)
 		}
 	}

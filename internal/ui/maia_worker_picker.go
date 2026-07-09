@@ -219,6 +219,66 @@ func NewWorktreeSpec(instances []*session.Instance, group string) (name, worktre
 	return "", "", "", fmt.Errorf("could not find an unused MAIA.<name> directory in %s after 20 attempts", maiaReposDir)
 }
 
+// isMaiaForkSource reports whether a session belongs to the MAIA main repo, so
+// the `f` quick-fork should land it in a fresh ad-hoc worktree (the same setup a
+// new MAIA session gets) rather than the generic fork/<slug> worktree. True when
+// the session records the MAIA repo as its worktree root, sits directly in the
+// main repo, or lives in a MAIA.<name> worktree dir. Pure string logic (no disk
+// access) so it is safe on every `f` press and in tests. (local fork)
+func isMaiaForkSource(inst *session.Instance) bool {
+	if inst == nil {
+		return false
+	}
+	if inst.WorktreeRepoRoot == maiaMainRepo {
+		return true
+	}
+	dir := filepath.Clean(inst.EffectiveWorkingDir())
+	if dir == maiaMainRepo {
+		return true
+	}
+	return filepath.Dir(dir) == maiaReposDir && strings.HasPrefix(filepath.Base(dir), "MAIA.")
+}
+
+// maiaForkSpec is the resolved identity + options for routing an `f` quick-fork
+// of a MAIA session into a fresh ad-hoc worktree. It mirrors a NEW MAIA
+// session's worktree setup (createMaiaAdhocWorktreeSession) — MAIA.<name> under
+// maiaReposDir, maia/active group, locked auto-name — while carrying the
+// parent's conversation via the shared fork machinery.
+type maiaForkSpec struct {
+	Title   string
+	Group   string
+	Opts    *session.ClaudeOptions
+	Toggles forkToggles
+}
+
+// buildMaiaForkSpec assembles the MAIA ad-hoc fork identity for a given source
+// and freshly-generated worktree spec (name/worktreePath/branch from
+// NewWorktreeSpec). It inherits the parent's persisted Claude options and pins
+// the worktree fields to the MAIA.<name> target off the main repo.
+//
+// WithState stays false on purpose: a new MAIA worktree starts fresh off
+// origin/dev (CreateWorktree's #973 behavior), so the fork does too — the
+// carried conversation is the point, not the parent's uncommitted files.
+func buildMaiaForkSpec(source *session.Instance, name, worktreePath, branch string) maiaForkSpec {
+	opts := source.GetClaudeOptions()
+	if opts == nil {
+		opts = &session.ClaudeOptions{}
+	}
+	opts.WorkDir = worktreePath
+	opts.WorktreePath = worktreePath
+	opts.WorktreeRepoRoot = maiaMainRepo
+	opts.WorktreeBranch = branch
+	return maiaForkSpec{
+		Title: name,
+		Group: maiaWorkerGroup,
+		Opts:  opts,
+		Toggles: forkToggles{
+			Worktree:  true,
+			LockTitle: true, // match MAIA workers: title shows live activity
+		},
+	}
+}
+
 // RoDevSelected returns the shared ro-dev worktree path and group, used by the
 // 'r' hotkey to create a read-only dev session directly (no column to browse).
 // Empty path means no ro-dev worktree exists.

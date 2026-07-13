@@ -30,9 +30,9 @@ const (
 // (unlike the MAIA picker, where shell is a side hotkey) because personal work
 // is a mix of agent sessions and plain terminals.
 const (
-	personalToolClaude = "claude"
-	personalToolCodex  = "codex"
-	personalToolShell  = "shell"
+	personalToolClaude  = "claude"
+	personalToolClaudex = "claudex"
+	personalToolShell   = "shell"
 )
 
 // personalTargetKind classifies a row so Enter knows what to create.
@@ -103,12 +103,12 @@ func (m *PersonalPicker) ActiveTool() string {
 	return m.tool
 }
 
-// ToggleTool cycles the active tool: Claude → Codex → Shell → Claude.
+// ToggleTool cycles the active tool: Claude → Claudex → Shell → Claude.
 func (m *PersonalPicker) ToggleTool() {
 	switch m.ActiveTool() {
 	case personalToolClaude:
-		m.tool = personalToolCodex
-	case personalToolCodex:
+		m.tool = personalToolClaudex
+	case personalToolClaudex:
 		m.tool = personalToolShell
 	default:
 		m.tool = personalToolClaude
@@ -255,7 +255,7 @@ func (m *PersonalPicker) View() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 }
 
-// renderToolSwitcher renders "Tool:  Claude  Codex  Shell" with the active tool
+// renderToolSwitcher renders "Tool:  Claude  Claudex  Shell" with the active tool
 // highlighted (Tab cycles).
 func (m *PersonalPicker) renderToolSwitcher() string {
 	labelStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
@@ -270,7 +270,7 @@ func (m *PersonalPicker) renderToolSwitcher() string {
 	}
 	return labelStyle.Render("Tool: ") +
 		style(personalToolClaude).Render(" Claude ") + "  " +
-		style(personalToolCodex).Render(" Codex ") + "  " +
+		style(personalToolClaudex).Render(" Claudex ") + "  " +
 		style(personalToolShell).Render(" Shell ")
 }
 

@@ -1199,6 +1199,14 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 		}
 	}
 
+	// Claudex runs GPT models, which we do not want driving the deferred
+	// tool-search loader. settings.json's `env` block outranks the process
+	// environment, so exporting ENABLE_TOOL_SEARCH=false in [tools.claudex].env
+	// is silently ignored — only --settings overrides it.
+	if i.Tool == "claudex" {
+		flags = append(flags, "--settings "+shellescape.Quote(`{"env":{"ENABLE_TOOL_SEARCH":"false"}}`))
+	}
+
 	// Options-level flags
 	if opts != nil {
 		if opts.SkipPermissions {

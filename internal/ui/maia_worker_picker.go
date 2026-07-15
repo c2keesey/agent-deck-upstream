@@ -138,7 +138,7 @@ type MaiaWorkerPicker struct {
 	visible    bool
 	roDevs     []string // ro-dev worktree paths
 	conductors []string // MAIA.conductor worktree paths (personal fork)
-	tool       string   // active tool the action keys create with ("claude" | "claudex")
+	tool       string   // active tool the action keys create with ("claude" | "codex")
 
 	width   int
 	height  int
@@ -156,12 +156,11 @@ func (m *MaiaWorkerPicker) Show() {
 	m.refreshWorktrees()
 }
 
-// Tools the picker can create with. Claude is the default; claudex is Claude
-// Code driving ChatGPT models through the local CLIProxyAPI (the native codex
-// harness is no longer used). See claudexToolOptions in home.go.
+// Tools the picker can create with. Codex always launches YOLO in the MAIA
+// flow (see createMaiaWorkerSession); Claude is the default.
 const (
-	maiaToolClaude  = "claude"
-	maiaToolClaudex = "claudex"
+	maiaToolClaude = "claude"
+	maiaToolCodex  = "codex"
 )
 
 // ActiveTool returns the tool the action keys (Enter, r, ~) will create with.
@@ -172,12 +171,12 @@ func (m *MaiaWorkerPicker) ActiveTool() string {
 	return m.tool
 }
 
-// ToggleTool flips the active tool between Claude and Claudex.
+// ToggleTool flips the active tool between Claude and Codex.
 func (m *MaiaWorkerPicker) ToggleTool() {
-	if m.ActiveTool() == maiaToolClaudex {
+	if m.ActiveTool() == maiaToolCodex {
 		m.tool = maiaToolClaude
 	} else {
-		m.tool = maiaToolClaudex
+		m.tool = maiaToolCodex
 	}
 }
 
@@ -411,7 +410,7 @@ func (m *MaiaWorkerPicker) renderSecondaryActions() string {
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
-// renderToolSwitcher renders the "Tool:  Claude  Claudex" selector with the
+// renderToolSwitcher renders the "Tool:  Claude  Codex" selector with the
 // active tool highlighted, so the user can see (and toggle with Tab) which
 // tool the action keys will create with.
 func (m *MaiaWorkerPicker) renderToolSwitcher() string {
@@ -419,12 +418,12 @@ func (m *MaiaWorkerPicker) renderToolSwitcher() string {
 	active := lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent).Bold(true)
 	inactive := lipgloss.NewStyle().Foreground(ColorTextDim)
 
-	claude, claudex := inactive, inactive
-	if m.ActiveTool() == maiaToolClaudex {
-		claudex = active
+	claude, codex := inactive, inactive
+	if m.ActiveTool() == maiaToolCodex {
+		codex = active
 	} else {
 		claude = active
 	}
 	return labelStyle.Render("Tool: ") +
-		claude.Render(" Claude ") + "  " + claudex.Render(" Claudex ")
+		claude.Render(" Claude ") + "  " + codex.Render(" Codex ")
 }

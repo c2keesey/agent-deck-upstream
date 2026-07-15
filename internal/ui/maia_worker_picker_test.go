@@ -26,8 +26,8 @@ func TestMaiaWorkerPicker_Hints(t *testing.T) {
 		}
 	}
 	// The tool switcher names both tools.
-	if !strings.Contains(view, "Claude") || !strings.Contains(view, "Claudex") {
-		t.Errorf("picker should render a Claude/Claudex tool switcher; got:\n%s", view)
+	if !strings.Contains(view, "Claude") || !strings.Contains(view, "Codex") {
+		t.Errorf("picker should render a Claude/Codex tool switcher; got:\n%s", view)
 	}
 }
 
@@ -37,10 +37,10 @@ func TestMaiaWorkerPicker_ToggleTool(t *testing.T) {
 	if got := p.ActiveTool(); got != maiaToolClaude {
 		t.Fatalf("default ActiveTool = %q, want %q", got, maiaToolClaude)
 	}
-	// Toggle to Claudex, then back to Claude.
+	// Toggle to Codex, then back to Claude.
 	p.ToggleTool()
-	if got := p.ActiveTool(); got != maiaToolClaudex {
-		t.Fatalf("after toggle, ActiveTool = %q, want %q", got, maiaToolClaudex)
+	if got := p.ActiveTool(); got != maiaToolCodex {
+		t.Fatalf("after toggle, ActiveTool = %q, want %q", got, maiaToolCodex)
 	}
 	p.ToggleTool()
 	if got := p.ActiveTool(); got != maiaToolClaude {

@@ -11184,31 +11184,11 @@ func (h *Home) handleMaiaWorkerPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// claudexModel is the ChatGPT model claudex sessions pin. It is served by the
-// local CLIProxyAPI, which the [tools.claudex] env in config.toml points at.
-const claudexModel = "gpt-5.6-sol"
-
-// claudexToolOptions pins the GPT model and skips approvals for claudex
-// sessions. The MAIA/personal flows trust their worktrees, so this is the
-// claude-family equivalent of the --yolo the native codex harness used to get.
-// Model lives in ClaudeOptions (not the tool's command) so it is replayed on
-// restart/resume rather than silently dropped.
-func claudexToolOptions(tool string) json.RawMessage {
-	if tool != maiaToolClaudex {
-		return nil
-	}
-	optionsJSON, _ := session.MarshalToolOptions(&session.ClaudeOptions{
-		Model:           claudexModel,
-		SkipPermissions: true,
-	})
-	return optionsJSON
-}
-
 // createMaiaWorkerSession creates a session rooted at an EXISTING shared MAIA
 // worktree (conductor / ro-dev — the 'c' and 'r' hotkeys) in the given group,
 // running the given command. An empty command yields a plain shell session;
-// "claudex" pins the GPT model and skips approvals (the MAIA flow trusts these
-// worktrees). Ad-hoc per-task worktrees go through
+// "codex" always launches in YOLO mode (the MAIA flow trusts these worktrees,
+// so codex skips approvals + sandbox). Ad-hoc per-task worktrees go through
 // createMaiaAdhocWorktreeSession instead.
 //
 // Naming: both workers and ro-dev get an auto-generated adjective-noun name so
@@ -11225,7 +11205,12 @@ func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.C
 		group = maiaWorkerGroup
 	}
 
-	toolOptionsJSON := claudexToolOptions(command)
+	// Codex always runs YOLO in the MAIA flow.
+	var toolOptionsJSON json.RawMessage
+	if command == "codex" {
+		yolo := true
+		toolOptionsJSON, _ = session.MarshalToolOptions(&session.CodexOptions{YoloMode: &yolo})
+	}
 
 	h.instancesMu.RLock()
 	name := session.GenerateUniqueSessionName(h.instances, group)
@@ -11262,7 +11247,12 @@ func (h *Home) createMaiaWorkerSession(projectPath, group, command string) tea.C
 // so the row shows live activity (branch → pane title → folder) instead of
 // Claude's conversation summary.
 func (h *Home) createMaiaAdhocWorktreeSession(command string) tea.Cmd {
-	toolOptionsJSON := claudexToolOptions(command)
+	// Codex always runs YOLO in the MAIA flow.
+	var toolOptionsJSON json.RawMessage
+	if command == "codex" {
+		yolo := true
+		toolOptionsJSON, _ = session.MarshalToolOptions(&session.CodexOptions{YoloMode: &yolo})
+	}
 
 	h.instancesMu.RLock()
 	name, worktreePath, branch, err := NewWorktreeSpec(h.instances, maiaWorkerGroup)
@@ -11411,8 +11401,7 @@ func (h *Home) quickCreateSessionAt(projectPath string) tea.Cmd {
 
 // quickCreateSessionAtWithTool is quickCreateSessionAt with an explicit tool
 // override (e.g. the MAIA picker's tool switcher). An empty tool falls back to
-// the configured default. Claudex pins its GPT model and skips approvals,
-// matching the worker flow.
+// the configured default. Codex always launches YOLO, matching the worker flow.
 func (h *Home) quickCreateSessionAtWithTool(projectPath, tool string) tea.Cmd {
 	if tool == "" {
 		tool = session.GetDefaultTool()
@@ -11425,7 +11414,11 @@ func (h *Home) quickCreateSessionAtWithTool(projectPath, tool string) tea.Cmd {
 		command = ""
 	}
 
-	toolOptionsJSON := claudexToolOptions(tool)
+	var toolOptionsJSON json.RawMessage
+	if tool == "codex" {
+		yolo := true
+		toolOptionsJSON, _ = session.MarshalToolOptions(&session.CodexOptions{YoloMode: &yolo})
+	}
 
 	preferred := deriveSessionNameFromPath(projectPath)
 	h.instancesMu.RLock()
@@ -15794,16 +15787,10 @@ func (h *Home) renderSessionItem(
 	}
 	primary := " " + padToCells(primaryStyle.Render(primaryText), cellWidth(primaryText), h.primaryColCells)
 
-	// YOLO (auto-approve / dangerous) mode for gemini/codex/hermes/claudex sessions.
+	// YOLO (auto-approve / dangerous) mode for gemini/codex/hermes sessions.
 	showYolo := false
 	if instTool == "gemini" && inst.GeminiYoloMode != nil && *inst.GeminiYoloMode {
 		showYolo = true
-	} else if instTool == "claudex" {
-		// Claudex always launches --dangerously-skip-permissions, so the row must
-		// say so; plain claude stays unbadged (it's the unmarked default).
-		if opts := inst.GetClaudeOptions(); opts != nil && opts.SkipPermissions {
-			showYolo = true
-		}
 	} else if instTool == "codex" {
 		if opts := inst.GetCodexOptions(); opts != nil && opts.YoloMode != nil && *opts.YoloMode {
 			showYolo = true
@@ -16370,13 +16357,6 @@ func (h *Home) renderLaunchingState(inst *session.Instance, width int, startTime
 			toolDesc = "Resuming Aider session..."
 		} else {
 			toolDesc = "Starting Aider..."
-		}
-	case "claudex":
-		toolName = "Claudex"
-		if isResuming {
-			toolDesc = "Resuming Claudex session..."
-		} else {
-			toolDesc = "Starting Claudex (GPT via proxy)..."
 		}
 	case "codex":
 		toolName = "Codex"

@@ -116,7 +116,7 @@ func (i *Instance) buildEnvSourceCommand() string {
 	//    wins over the same key from the file; the conductor map is applied
 	//    over the group map (CFG-08 precedence: conductor > group). Same
 	//    tool gate as the claude branch of getToolEnvFile.
-	if IsClaudeCompatible(i.Tool) {
+	if i.Tool == "claude" {
 		if claudeEnv := i.getClaudeInlineEnv(config); claudeEnv != "" {
 			sources = append(sources, claudeEnv)
 		}

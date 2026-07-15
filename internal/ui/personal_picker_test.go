@@ -30,8 +30,8 @@ func TestPersonalPicker_ToggleTool(t *testing.T) {
 		t.Fatalf("default ActiveTool = %q, want %q", got, personalToolClaude)
 	}
 	p.ToggleTool()
-	if got := p.ActiveTool(); got != personalToolClaudex {
-		t.Fatalf("ActiveTool = %q, want %q", got, personalToolClaudex)
+	if got := p.ActiveTool(); got != personalToolCodex {
+		t.Fatalf("ActiveTool = %q, want %q", got, personalToolCodex)
 	}
 	p.ToggleTool()
 	if got := p.ActiveTool(); got != personalToolShell {
@@ -121,7 +121,7 @@ func TestPersonalPicker_EmptyFilterSelectionSafe(t *testing.T) {
 func TestPersonalPicker_View(t *testing.T) {
 	p := samplePicker()
 	view := p.View()
-	for _, want := range []string{"Claude", "Claudex", "Shell", "optiplex", "Filter", "Enter create"} {
+	for _, want := range []string{"Claude", "Codex", "Shell", "optiplex", "Filter", "Enter create"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q; got:\n%s", want, view)
 		}

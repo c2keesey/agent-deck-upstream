@@ -892,17 +892,6 @@ func (d *NewDialog) filterPathSuggestions() {
 
 func knownModelIDsForTool(tool string) []string {
 	switch {
-	case tool == "claudex":
-		// Claudex reaches ChatGPT models through the local CLIProxyAPI, which
-		// serves no claude-* ids. Offering the Claude list here would send a
-		// model the proxy cannot route.
-		return []string{
-			"gpt-5.6-sol",
-			"gpt-5.6-terra",
-			"gpt-5.6-luna",
-			"gpt-5.5",
-			"gpt-5.4",
-		}
 	case session.IsClaudeCompatible(tool):
 		return []string{
 			"claude-sonnet-4-6",

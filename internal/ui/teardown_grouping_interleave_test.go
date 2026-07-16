@@ -10,8 +10,8 @@ import (
 )
 
 // These tests simulate realistic message interleavings of the teardown flow
-// (d on a MAIA worktree session → confirm → teardownResultMsg → deleteSession
-// cmd → sessionDeletedMsg) with storage reloads (storageChangedMsg →
+// (d on a MAIA worktree session → confirm → shell cleanup + inline delete on
+// the cmd goroutine → sessionDeletedMsg) with storage reloads (storageChangedMsg →
 // loadSessionsMsg with restoreState) and tick-driven rebuilds, and assert
 // grouping integrity invariants after every step:
 //
@@ -196,8 +196,8 @@ func pressKey(t *testing.T, h *Home, r rune) tea.Cmd {
 
 // startTeardown drives the user-visible teardown entry: d on the cursor row
 // (must be a MAIA worktree session → teardown confirmation) and confirm. The
-// returned shell cmd is deliberately NOT executed — its only observable
-// output, teardownResultMsg, is injected by the individual tests.
+// returned shell cmd is deliberately NOT executed — individual tests trigger
+// its delete step by hand via runTeardownResult (finishTeardown).
 func startTeardown(t *testing.T, h *Home) {
 	t.Helper()
 	if cmd := pressKey(t, h, 'd'); cmd != nil {
@@ -268,22 +268,15 @@ func drainCmd(cmd tea.Cmd) []tea.Msg {
 	return []tea.Msg{msg}
 }
 
-// runTeardownResult feeds teardownResultMsg for id and executes the
-// deleteSession cmd it returns, producing the sessionDeletedMsg (not applied).
+// runTeardownResult finishes the teardown for id the way the production cmd
+// does — the delete side effects run inline on the cmd goroutine, not via an
+// update-loop hop (which would stall while the user is attached under
+// tea.Exec) — and returns the resulting sessionDeletedMsg (not applied).
+// Returns nil if the teardown aborted (e.g. session no longer exists).
 func runTeardownResult(t *testing.T, h *Home, id, title string) tea.Msg {
 	t.Helper()
-	model, cmd := h.Update(teardownResultMsg{id: id, title: title})
-	if model.(*Home) != h {
-		t.Fatalf("Update returned different model")
-	}
-	if cmd == nil {
-		return nil // teardown handler aborted (e.g. session no longer exists)
-	}
-	msgs := drainCmd(cmd)
-	for _, m := range msgs {
-		if dm, ok := m.(sessionDeletedMsg); ok {
-			return dm
-		}
+	if dm, ok := h.finishTeardown(id, title, "").(sessionDeletedMsg); ok {
+		return dm
 	}
 	return nil
 }

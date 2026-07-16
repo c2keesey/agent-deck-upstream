@@ -1031,15 +1031,15 @@ type sendOutputResultMsg struct {
 	err         error
 }
 
-// teardownResultMsg is sent when the async teardown send sequence completes.
-// On success id is the session to delete; the handler re-resolves it by ID so a
-// storage reload during the (minutes-long) teardown can't make us delete a
-// stale pointer.
+// teardownResultMsg is sent only when a teardown fails before its delete step
+// (no working dir, or the session vanished during the shell cleanup). The
+// success path never produces it: the teardown cmd chains the delete inline on
+// its own goroutine and returns sessionDeletedMsg directly (see finishTeardown)
+// — a message hop here would park in the queue while the user is attached
+// (tea.Exec blocks the update loop) and stall the teardown until detach.
 type teardownResultMsg struct {
 	title string
-	id    string
-	warn  string // non-fatal cleanup failure (gr/make down) — still deletes
-	err   error  // setup failure (no working dir) — aborts deletion
+	err   error
 }
 
 // remoteSessionsFetchedMsg is sent when async remote sessions fetch completes.
@@ -5333,6 +5333,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.remoteReclaimErr != nil {
 			h.setError(msg.remoteReclaimErr)
 		}
+		// Surface the outcome of a MAIA teardown this delete was chained from.
+		if msg.teardownWarn != "" {
+			h.setError(fmt.Errorf("Teardown '%s' cleanup warning (%s) — deleted anyway", msg.teardownTitle, msg.teardownWarn))
+		} else if msg.teardownTitle != "" {
+			h.setError(fmt.Errorf("Teardown done for '%s' — deleted", msg.teardownTitle))
+		}
 
 		// Tombstone this id (past the reload-requeue early-return above, so a
 		// requeued message doesn't tombstone before the delete is truly applied)
@@ -6320,27 +6326,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case teardownResultMsg:
-		// The `gr` + `make down` cleanup finished; delete the session. A setup
-		// failure (no working dir) aborts; a cleanup failure only warns.
-		if msg.err != nil {
-			h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
-			return h, nil
-		}
-		// Re-resolve by ID: the pointer captured at key-press may have been
-		// replaced by a storage reload during the long-running teardown.
-		h.instancesMu.RLock()
-		inst := h.instanceByID[msg.id]
-		h.instancesMu.RUnlock()
-		if inst == nil {
-			h.setError(fmt.Errorf("teardown '%s': session no longer exists", msg.title))
-			return h, nil
-		}
-		if msg.warn != "" {
-			h.setError(fmt.Errorf("Teardown '%s' cleanup warning (%s) — deleting anyway", msg.title, msg.warn))
-		} else {
-			h.setError(fmt.Errorf("Teardown done for '%s' — deleting", msg.title))
-		}
-		return h, h.deleteSession(inst)
+		// A teardown that failed before its delete step (no working dir, or
+		// the session vanished mid-cleanup). Success skips this message: the
+		// teardown cmd chains the delete inline and returns sessionDeletedMsg
+		// directly (see finishTeardown).
+		h.setError(fmt.Errorf("teardown '%s': %v", msg.title, msg.err))
+		return h, nil
 
 	case watcherEventMsg:
 		// One-shot log per engine instance to confirm the listener path is alive.
@@ -9118,7 +9109,8 @@ func (h *Home) confirmAction() tea.Cmd {
 	case ConfirmTeardownSession:
 		// MAIA teardown flavor of delete: run `gr` (reset worktree) + `make
 		// down` (stop docker) directly in the worktree, tool-agnostically,
-		// then delete the session (teardownResultMsg → deleteSession).
+		// then delete the session inline on the same cmd goroutine
+		// (finishTeardown → sessionDeletedMsg).
 		sessionID := h.confirmDialog.GetTargetID()
 		if inst := h.getInstanceByID(sessionID); inst != nil {
 			h.confirmDialog.Hide()
@@ -12076,8 +12068,10 @@ func forkWithStateWorkspaceJJ(parentPath, repoRoot, workspacePath, branch string
 // sessionDeletedMsg signals that a session was deleted
 type sessionDeletedMsg struct {
 	deletedID        string
-	killErr          error // Error from Kill() if any
-	remoteReclaimErr error // MAIA remote: box-side teardown (remote-reclaim-box) failed
+	killErr          error  // Error from Kill() if any
+	remoteReclaimErr error  // MAIA remote: box-side teardown (remote-reclaim-box) failed
+	teardownTitle    string // non-empty when this delete was chained from a MAIA teardown
+	teardownWarn     string // teardown shell cleanup failure (gr/make down) — deleted anyway
 }
 
 // sessionClosedMsg signals that a session process was closed without deleting metadata.
@@ -18444,14 +18438,36 @@ func (h *Home) teardownSession(s *session.Instance) tea.Cmd {
 		// the stack down regardless, so run them independently.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		cmd := teardownCommand(ctx, dir)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		warn := ""
+		if out, err := teardownCommand(ctx, dir).CombinedOutput(); err != nil {
 			// Cleanup is best-effort — a missing docker stack (e.g. ro-dev) or a
 			// failed reset shouldn't strand the session. Warn but still delete.
-			return teardownResultMsg{title: title, id: id, warn: fmt.Sprintf("%v: %s", err, lastLine(string(out)))}
+			warn = fmt.Sprintf("%v: %s", err, lastLine(string(out)))
 		}
-		return teardownResultMsg{title: title, id: id}
+		return h.finishTeardown(id, title, warn)
 	}
+}
+
+// finishTeardown runs the delete step of a teardown inline on the calling
+// (cmd) goroutine and returns the resulting message. The delete must NOT ride
+// a message hop back through the update loop (teardownResultMsg → Update →
+// deleteSession cmd): while the user is attached to a session, tea.Exec
+// blocks the loop, so the hop would park in the queue and the tmux kill /
+// worktree removal would stall until detach — teardown only progressed while
+// the dashboard was visible. Re-resolves by ID because the pointer captured
+// at key-press may have been replaced by a storage reload during the
+// (minutes-long) shell cleanup.
+func (h *Home) finishTeardown(id, title, warn string) tea.Msg {
+	h.instancesMu.RLock()
+	inst := h.instanceByID[id]
+	h.instancesMu.RUnlock()
+	if inst == nil {
+		return teardownResultMsg{title: title, err: fmt.Errorf("session no longer exists")}
+	}
+	msg := h.deleteSession(inst)().(sessionDeletedMsg)
+	msg.teardownTitle = title
+	msg.teardownWarn = warn
+	return msg
 }
 
 // teardownCommand builds the `gr; make down` cleanup command for dir. It uses an

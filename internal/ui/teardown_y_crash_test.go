@@ -154,9 +154,9 @@ func TestIsMaiaTeardownWorktree(t *testing.T) {
 		{maiaReposDir + "/MAIA.conductor", false},
 		{maiaReposDir + "/MAIA.ro-dev", false},
 		{maiaReposDir + "/MAIA.ro-dev-2", false},
-		{maiaReposDir + "/glib", false},                    // sibling non-MAIA repo
-		{maiaReposDir + "/nested/MAIA.worker-1", false},    // not directly under repos dir
-		{"/tmp/elsewhere/MAIA.worker-1", false},            // outside repos dir
+		{maiaReposDir + "/glib", false},                 // sibling non-MAIA repo
+		{maiaReposDir + "/nested/MAIA.worker-1", false}, // not directly under repos dir
+		{"/tmp/elsewhere/MAIA.worker-1", false},         // outside repos dir
 		{"", false},
 	}
 	for _, tc := range cases {

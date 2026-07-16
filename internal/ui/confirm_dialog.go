@@ -48,6 +48,13 @@ type ConfirmDialog struct {
 	sandboxed   bool // Whether the session uses a Docker sandbox.
 	worktree    bool // Whether the session has an associated git worktree.
 
+	// compoundWarn surfaces the missing-/compound warning in delete/teardown/
+	// close confirmations: the session's transcript shows user work but the
+	// /compound skill was never invoked. Set via SetCompoundWarning after the
+	// Show* call (kept out of the Show* signatures so upstream call sites are
+	// untouched). (local fork)
+	compoundWarn bool
+
 	remoteName string // Remote name for remote session confirmations.
 
 	// Notice (ConfirmNotice) carries an acknowledge-only title/body.
@@ -252,6 +259,12 @@ func (c *ConfirmDialog) GetPendingSession() (name, path, command, groupPath stri
 	return c.pendingSessionName, c.pendingSessionPath, c.pendingSessionCommand, c.pendingSessionGroupPath, c.pendingToolOptionsJSON, c.pendingClaudeExtraArgs, c.pendingClaudeStartQuery, c.pendingLaunchModelID, c.pendingParentSessionID, c.pendingParentProjectPath
 }
 
+// SetCompoundWarning toggles the missing-/compound warning for the currently
+// shown dialog. (local fork)
+func (c *ConfirmDialog) SetCompoundWarning(warn bool) {
+	c.compoundWarn = warn
+}
+
 // Hide hides the dialog.
 func (c *ConfirmDialog) Hide() {
 	c.visible = false
@@ -261,6 +274,7 @@ func (c *ConfirmDialog) Hide() {
 	c.remoteName = ""
 	c.noticeTitle = ""
 	c.noticeBody = ""
+	c.compoundWarn = false
 }
 
 // IsVisible returns whether the dialog is visible
@@ -497,6 +511,13 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Skip", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y install · n skip · ←/→ navigate · Enter select · Esc"))
+	}
+
+	// Missing-/compound warning: the session did user-visible work but the
+	// /compound skill was never invoked — closing/removing it now throws the
+	// undocumented learnings away. (local fork)
+	if c.compoundWarn {
+		warning += "\n\n✋ /compound was never run in this session —\nits learnings are not documented yet"
 	}
 
 	// Title style
